@@ -1,0 +1,38 @@
+vision:
+  use_deepface: false
+  frame_stride: 5
+  emotion_threshold: 0.6
+  intensity_threshold: 0.2
+
+audio:
+  enabled: false
+  min_intensity: 0.3
+  min_onset_strength: 0.3
+
+text:
+  enabled: true
+  keywords:
+    - pattern: "圣旨"
+      weight: 1.0
+    - pattern: "皇上"
+      weight: 0.8
+    - pattern: "夺嫡"
+      weight: 1.0
+    - pattern: "交接兵权"
+      weight: 1.0
+    - pattern: "反转"
+      weight: 0.9
+
+fusion:
+  weights:
+    vision: 0.5
+    audio: 0.3
+    text: 0.2
+  threshold_on: 0.5
+  threshold_off: 0.3
+  cooldown_sec: 1.0
+  half_life_sec: 3.0
+
+actions:
+  freeze_frame:
+    enabled: true

@@ -1,0 +1,5 @@
+# Example compose configuration for 5-minute highlight reels
+# Used as a reference for the compose CLI --target-duration option.
+# 当前 PoC 中不会被代码直接读取，可作为团队间约定的配置样例。
+
+target_duration_sec: 300  # 5 minutes

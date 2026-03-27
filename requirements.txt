@@ -1,0 +1,10 @@
+opencv-python
+numpy
+librosa
+pydub
+PyYAML
+edge-tts  # Optional TTS; in offline environments you can skip this, code will fall back to short silent WAV.
+
+# Optional vision emotion libraries (not required to run the PoC):
+# deepface
+# fer

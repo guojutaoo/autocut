@@ -1,0 +1,42 @@
+vision:
+  # Whether to attempt DeepFace-based emotion recognition. This requires
+  # the optional "deepface" package and its pretrained weights.
+  use_deepface: false
+  frame_stride: 10
+  emotion_threshold: 0.6
+  intensity_threshold: 0.25
+
+audio:
+  enabled: true
+  # Minimum normalized RMS value to treat as an intensity peak.
+  min_intensity: 0.3
+  # Not directly used yet, reserved for future onset-based gating.
+  min_onset_strength: 0.3
+
+text:
+  enabled: true
+  keywords:
+    - pattern: "圣旨"
+      weight: 1.0
+    - pattern: "皇上"
+      weight: 0.8
+    - pattern: "夺嫡"
+      weight: 1.0
+    - pattern: "交接兵权"
+      weight: 1.0
+    - pattern: "反转"
+      weight: 0.9
+
+fusion:
+  weights:
+    vision: 0.5
+    audio: 0.3
+    text: 0.2
+  threshold_on: 0.7
+  threshold_off: 0.4
+  cooldown_sec: 3.0
+  half_life_sec: 2.0
+
+actions:
+  freeze_frame:
+    enabled: true

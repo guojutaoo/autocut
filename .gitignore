@@ -1,0 +1,106 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Project specific - outputs and generated files
+outputs/
+*.mp4
+*.avi
+*.wav
+*.mp3
+*.aac
+*.flac
+*.ogg
+*.m4a
+*.wma
+*.mov
+*.mkv
+*.flv
+*.wmv
+
+# Generated subtitle files
+*.ass
+*.srt
+*.vtt
+
+# Generated images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# Generated JSON and text files (runtime outputs)
+*_output.json
+run_summary.json
+triggers.json
+validation_report.json
+validation_report.md
+transcript_for_llm.txt
+llm_script_audit.json
+compose_plan.json
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+
+# Project specific temp directories
+.backup_before_zip/
+.zip_update_tmp/
+compose_xhs_tmp/
+narrations/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Test outputs
+tests/__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Trae specific (keep documents but ignore other generated files)
+.trae/skills/
+.trae/specs/
