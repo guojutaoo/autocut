@@ -20,6 +20,12 @@ except ImportError:
     ImageDraw = None  # type: ignore
     ImageFont = None  # type: ignore
 
+try:
+    from ..freeze_effects import FreezeEffectEngine, load_effect_preset
+except ImportError:
+    FreezeEffectEngine = None  # type: ignore
+    load_effect_preset = None  # type: ignore
+
 
 logger = logging.getLogger(__name__)
 
@@ -514,7 +520,7 @@ def _generate_ass_subtitle(
     speech_start: float = 0.0,
     speech_duration: float = 0.0,
     fps: float = 30.0,
-    bottom_margin: int = 120,
+    bottom_margin: int = 180,
     tts_boundaries_path: Optional[str] = None,
 ) -> str:
     """Generate an .ass subtitle file for the given text with timing."""
@@ -542,7 +548,7 @@ def _generate_ass_subtitle(
     min_dur = float(os.environ.get("AUTOCUT_SUB_MIN_DUR", "1.0") or 1.0)
     speed_mode = str(os.environ.get("AUTOCUT_SUB_SPEED_MODE", "auto") or "auto").strip().lower()
     cps_raw = str(os.environ.get("AUTOCUT_SUB_CPS", "6") or "6").strip().lower()
-    visible_chars_limit = int(os.environ.get("AUTOCUT_SUB_VISIBLE_CHARS", "36") or 36)
+    visible_chars_limit = int(os.environ.get("AUTOCUT_SUB_VISIBLE_CHARS", "24") or 24)
     min_dur = max(0.2, min_dur)
     visible_chars_limit = max(10, visible_chars_limit)
 
@@ -592,7 +598,7 @@ def _generate_ass_subtitle(
             if tokens:
                 pause_thr = float(os.environ.get("AUTOCUT_SUB_PAUSE_THR", "0.40") or 0.40)
                 pause_thr = float(_clamp(pause_thr, 0.05, 2.0))
-                max_chars = int(os.environ.get("AUTOCUT_SUB_VISIBLE_CHARS", "36") or 36)
+                max_chars = int(os.environ.get("AUTOCUT_SUB_VISIBLE_CHARS", "24") or 24)
                 max_chars = max(10, max_chars)
                 out_chunks: List[tuple[float, float, str]] = []
 
@@ -624,17 +630,27 @@ def _generate_ass_subtitle(
 
                 if out_chunks:
                     fps = float(fps) if fps else 30.0
+                    try:
+                        fixed_lines = int(os.environ.get("AUTOCUT_ASS_LINES", "3") or 3)
+                    except Exception:
+                        fixed_lines = 3
+                    fixed_lines = max(1, min(6, fixed_lines))
+                    font_size = 70
+                    line_height = int(font_size * 1.2)
+                    fixed_top_margin = max(0, int(h - bottom_margin - fixed_lines * line_height))
+                    pos_x = int(w / 2)
+                    pos_tag = f"{{\\an8\\pos({pos_x},{fixed_top_margin})}}"
                     ass_content = [
                         "[Script Info]",
                         "ScriptType: v4.00+",
                         "Timer: 100.0000",
                         f"PlayResX: {w}",
                         f"PlayResY: {h}",
-                        "WrapStyle: 1",
+                        "WrapStyle: 2",
                         "",
                         "[V4+ Styles]",
                         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-                        f"Style: Default,PingFang SC,64,&H00FFFFFF,&H000000FF,&H00000000,&H88000000,0,0,0,0,100,100,0,0,3,2,0,2,20,20,{bottom_margin},1",
+                        f"Style: Default,PingFang SC,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,20,20,{fixed_top_margin},1",
                         "",
                         "[Events]",
                         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -653,10 +669,11 @@ def _generate_ass_subtitle(
                         if len(segs) >= 2 and len(segs[-1]) < 3:
                             segs[-2] += segs[-1]
                             segs = segs[:-1]
-                        if len(segs) > 2:
-                            segs = segs[:2]
-                            if segs[1]:
-                                segs[1] = (segs[1][:-1] + "…") if len(segs[1]) >= 2 else "…"
+                        if len(segs) > fixed_lines:
+                            segs = segs[:fixed_lines]
+                        if len(segs) < fixed_lines:
+                            pad = [r"{\alpha&HFF&}　"] * (fixed_lines - len(segs))
+                            segs = segs + pad
                         return "\\N".join(segs).replace("\n", "\\N")
 
                     for t0, t1, value in out_chunks:
@@ -671,7 +688,7 @@ def _generate_ass_subtitle(
                         if et <= st:
                             continue
                         ass_content.append(
-                            f"Dialogue: 0,{format_ass_time(st)},{format_ass_time(et)},Default,,0,0,0,,{wrap_ass_text(value)}"
+                            f"Dialogue: 0,{format_ass_time(st)},{format_ass_time(et)},Default,,0,0,0,,{pos_tag}{wrap_ass_text(value)}"
                         )
 
                     with open(ass_path, "w", encoding="utf-8") as f:
@@ -701,6 +718,16 @@ def _generate_ass_subtitle(
         return ass_path
 
     fps = float(fps) if fps else 30.0
+    try:
+        fixed_lines = int(os.environ.get("AUTOCUT_ASS_LINES", "3") or 3)
+    except Exception:
+        fixed_lines = 3
+    fixed_lines = max(1, min(6, fixed_lines))
+    font_size = 70
+    line_height = int(font_size * 1.2)
+    fixed_top_margin = max(0, int(h - bottom_margin - fixed_lines * line_height))
+    pos_x = int(w / 2)
+    pos_tag = f"{{\\an8\\pos({pos_x},{fixed_top_margin})}}"
 
     # ASS Header
     ass_content = [
@@ -709,12 +736,11 @@ def _generate_ass_subtitle(
         "Timer: 100.0000",
         f"PlayResX: {w}",
         f"PlayResY: {h}",
-        "WrapStyle: 1",
+        "WrapStyle: 2",
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        # Style with semi-transparent background (BorderStyle=3 creates an opaque box)
-        f"Style: Default,PingFang SC,64,&H00FFFFFF,&H000000FF,&H00000000,&H88000000,0,0,0,0,100,100,0,0,3,2,0,2,20,20,{bottom_margin},1",
+        f"Style: Default,PingFang SC,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,8,20,20,{fixed_top_margin},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
@@ -733,10 +759,11 @@ def _generate_ass_subtitle(
         if len(segs) >= 2 and len(segs[-1]) < 3:
             segs[-2] += segs[-1]
             segs = segs[:-1]
-        if len(segs) > 2:
-            segs = segs[:2]
-            if segs[1]:
-                segs[1] = (segs[1][:-1] + "…") if len(segs[1]) >= 2 else "…"
+        if len(segs) > fixed_lines:
+            segs = segs[:fixed_lines]
+        if len(segs) < fixed_lines:
+            pad = [r"{\alpha&HFF&}　"] * (fixed_lines - len(segs))
+            segs = segs + pad
         return "\\N".join(segs).replace("\n", "\\N")
 
     if speed_mode not in ("auto", "fixed"):
@@ -796,7 +823,7 @@ def _generate_ass_subtitle(
         next_t = min(end_t, cur_t + d)
         start_str = format_ass_time(cur_t)
         end_str = format_ass_time(next_t)
-        ass_content.append(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{wrap_ass_text(p)}")
+        ass_content.append(f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{pos_tag}{wrap_ass_text(p)}")
         cur_t = next_t
 
     with open(ass_path, "w", encoding="utf-8") as f:
@@ -889,7 +916,7 @@ def _render_segment_with_narration(
         speech_start=narration_offset_sec,
         speech_duration=speech_active_dur,
         fps=v_fps,
-        bottom_margin=120,
+        bottom_margin=180,
         tts_boundaries_path=tts_boundaries_path if tts_boundaries_available else None,
     )
 
@@ -978,6 +1005,7 @@ def _build_segment_video(
     tmp_dir: str,
     vf_args: Sequence[str] | None = None,
     narration_text: Optional[str] = None,
+    freeze_effect_engine: Optional[Any] = None,
 ) -> str:
     """Materialize a single highlight segment using ffmpeg.
 
@@ -1399,6 +1427,29 @@ def _build_segment_video(
                 freeze_video,
             ]
         )
+
+    if freeze_effect_engine is not None and FreezeEffectEngine is not None:
+        freeze_effective_video = os.path.join(tmp_dir, f"{prefix}_freeze_with_effect.mp4")
+        v_width, v_height = _get_video_resolution(video_path)
+        if vf_args:
+            for arg in vf_args:
+                if "pad=" in arg:
+                    import re
+                    match = re.search(r"pad=(\d+):(\d+)", arg)
+                    if match:
+                        v_width, v_height = int(match.group(1)), int(match.group(2))
+        effect_applied = freeze_effect_engine.apply_effects_to_freeze_segment(
+            freeze_video,
+            freeze_audio_final,
+            freeze_effective_video,
+            freeze_duration,
+            fps_int,
+            v_width,
+            v_height,
+        )
+        if effect_applied and os.path.exists(freeze_effective_video):
+            freeze_video = freeze_effective_video
+
     clip_files.append(freeze_video)
 
     # Post clip
@@ -1704,6 +1755,7 @@ def compose_segments_xhs(
     render: Optional[Dict[str, Any]] = None,
     output_basename: str = "compose_xhs.mp4",
     narration_texts: Sequence[Optional[str]] | None = None,
+    freeze_effect: Optional[str] = None,
 ) -> Optional[str]:
     """Compose an XHS-oriented highlight reel with per-segment narration.
 
@@ -1714,6 +1766,12 @@ def compose_segments_xhs(
 
     When ``ffmpeg`` is not available on the system, the function returns
     ``None`` and does not attempt any media rendering.
+
+    Args:
+        freeze_effect: Optional freeze effect preset name (e.g., "weibo_pop",
+            "cinematic", "dramatic", "subtle", "none"). When provided, applies
+            the effect to all freeze segments in the video. Effects include
+            white flash, zoom-in, and stinger audio.
     """
 
     if not _has_ffmpeg():
@@ -1749,6 +1807,12 @@ def compose_segments_xhs(
         os.environ.get("AUTOCUT_KEEP_TMP", "").strip().lower() not in ("", "0", "false")
         or logger.isEnabledFor(logging.DEBUG)
     )
+
+    freeze_effect_engine = None
+    if freeze_effect and freeze_effect != "none" and FreezeEffectEngine is not None:
+        freeze_effect_engine = FreezeEffectEngine(freeze_effect)
+        logger.info("Freeze effect enabled: %s", freeze_effect)
+
     try:
         for idx, seg in enumerate(segments):
             narr_audio = narration_audios[idx] if idx < len(narration_audios) else None
@@ -1760,6 +1824,7 @@ def compose_segments_xhs(
                 tmp_dir,
                 vf_args=vf_args,
                 narration_text=narr_text,
+                freeze_effect_engine=freeze_effect_engine,
             )
             segment_videos.append(seg_video)
 

@@ -167,17 +167,20 @@ async def _synthesize_with_edge_tts_boundaries(
     directory = os.path.dirname(out_path) or "."
     os.makedirs(directory, exist_ok=True)
 
+    boundary_count = 0
+    chunk_types_seen = set()
     with open(out_path, "wb") as f:
         async for chunk in communicate.stream():
             kind = chunk.get("type")
+            chunk_types_seen.add(kind)
             if kind == "audio":
                 data = chunk.get("data")
                 if data:
                     f.write(data)
-            elif kind == "WordBoundary":
+            elif kind in ("word boundary", "sentence boundary", "WordBoundary", "SentenceBoundary"):
                 offset = chunk.get("offset")
                 duration = chunk.get("duration")
-                token = chunk.get("text") or chunk.get("word") or ""
+                token = chunk.get("text") or chunk.get("boundary_text") or chunk.get("word") or ""
                 try:
                     offset_i = int(offset)
                     duration_i = int(duration)
@@ -192,6 +195,11 @@ async def _synthesize_with_edge_tts_boundaries(
                         "end": _to_seconds_from_edge_tts_ticks(offset_i + duration_i),
                     }
                 )
+                boundary_count += 1
+    
+    logger.info("TTS chunk types seen: %s", chunk_types_seen)
+    
+    logger.info("TTS synthesis completed: %s, boundaries collected: %d", out_path, boundary_count)
 
     with open(sidecar, "w", encoding="utf-8") as f:
         json.dump(

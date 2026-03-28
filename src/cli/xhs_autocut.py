@@ -115,6 +115,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--from-plan", help="Path to an existing compose_plan.json to render from."
     )
+    parser.add_argument(
+        "--freeze-effect",
+        default=None,
+        help=(
+            "Freeze effect preset name: 'weibo_pop', 'cinematic', 'dramatic', 'subtle', or 'none'. "
+            "When set, applies white flash + zoom-in + stinger audio to all freeze segments."
+        ),
+    )
     return parser
 
 
@@ -671,6 +679,7 @@ def main(argv: Any = None) -> None:
     skip_end = float(args.skip_end)
     render_now = bool(args.render)
     from_plan = args.from_plan
+    freeze_effect = args.freeze_effect
 
     if not os.path.exists(video_path):
         logger.error("Input video does not exist: %s", video_path)
@@ -843,6 +852,7 @@ def main(argv: Any = None) -> None:
             render=render_spec,
             output_basename="compose.mp4",
             narration_texts=narration_texts,
+            freeze_effect=freeze_effect,
         )
         logger.info("Video generated at %s", output_video)
         return
@@ -1113,6 +1123,7 @@ def main(argv: Any = None) -> None:
             render=render_spec,
             output_basename="compose.mp4",
             narration_texts=selected_narrations,
+            freeze_effect=freeze_effect,
         )
         if output_video:
             logger.info("Compose video generated at %s", output_video)
