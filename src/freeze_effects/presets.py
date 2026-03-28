@@ -48,6 +48,20 @@ PRESETS = {
         "stinger": {"enabled": True, "duration_ms": 150, "frequency": 2400, "gain_db": -4.0, "fade_out_ms": 100},
     },
 
+    "camera_click": {
+        "white_flash": {"enabled": True, "duration_ms": 70, "intensity": 0.9},
+        "zoom_in": {"enabled": True, "start_zoom": 1.0, "end_zoom": 1.03, "ease": "linear"},
+        "stinger": {
+            "enabled": True,
+            "duration_ms": 0,
+            "frequency": 2400,
+            "gain_db": -1.0,
+            "fade_out_ms": 0,
+            "profile": "file",
+            "file_path": "src/audio/assets/camera_click.mp3",
+        },
+    },
+
     "subtle": {
         "white_flash": {"enabled": True, "duration_ms": 60, "intensity": 0.4},
         "zoom_in": {"enabled": True, "start_zoom": 1.0, "end_zoom": 1.03, "ease": "linear"},

@@ -581,6 +581,8 @@ def _generate_ass_subtitle(
             with open(tts_boundaries_path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             items = payload.get("boundaries", payload)
+            max_chars_env = int(os.environ.get("AUTOCUT_SUB_VISIBLE_CHARS", "24") or 24)
+            max_chars_env = max(10, max_chars_env)
             tokens = []
             for it in items:
                 try:
@@ -593,7 +595,19 @@ def _generate_ass_subtitle(
                 tok = str(it.get("text") or "").strip()
                 if not tok:
                     continue
-                tokens.append((t0, t1, tok))
+                if len(tok) > max_chars_env:
+                    total_len = float(len(tok))
+                    acc = 0.0
+                    for i in range(0, len(tok), max_chars_env):
+                        piece = tok[i : i + max_chars_env]
+                        if not piece:
+                            continue
+                        seg_start = t0 + (t1 - t0) * (acc / total_len)
+                        acc += len(piece)
+                        seg_end = t0 + (t1 - t0) * (acc / total_len)
+                        tokens.append((seg_start, seg_end, piece))
+                else:
+                    tokens.append((t0, t1, tok))
 
             if tokens:
                 pause_thr = float(os.environ.get("AUTOCUT_SUB_PAUSE_THR", "0.40") or 0.40)
@@ -845,6 +859,7 @@ def _render_segment_with_narration(
     tmp_dir: str,
     bg_duck_db: float = -30.0,
     mute_bg_when_tts: bool = False,
+    duck_exclude_ranges: Optional[List[Tuple[float, float]]] = None,
 ) -> str:
     fps_int = int(round(v_fps)) if v_fps else 30
     if fps_int <= 0:
@@ -939,8 +954,13 @@ def _render_segment_with_narration(
 
     if narration_audio and os.path.exists(narration_audio):
         v_filter = f"[0:v]setpts=PTS-STARTPTS,subtitles={safe_ass_path_escaped}[vout];"
+        duck_enable = f"between(t,{duck_start:.3f},{duck_end:.3f})"
+        if duck_exclude_ranges:
+            for start, end in duck_exclude_ranges:
+                if end > start:
+                    duck_enable += f"*not(between(t,{start:.3f},{end:.3f}))"
         v_filter += (
-            f"[0:a]asetpts=PTS-STARTPTS,volume={duck_factor:.6f}:enable='between(t,{duck_start:.3f},{duck_end:.3f})'[bg];"
+            f"[0:a]asetpts=PTS-STARTPTS,volume={duck_factor:.6f}:enable='{duck_enable}'[bg];"
             f"[1:a]atrim=start={tts_trim_start:.3f}:end={tts_trim_end:.3f},asetpts=PTS-STARTPTS,adelay={narration_delay_ms}|{narration_delay_ms}[tts];"
             "[bg][tts]amix=inputs=2:duration=first:dropout_transition=0[aout]"
         )
@@ -1048,13 +1068,29 @@ def _build_segment_video(
             end = start + 2.0
         clip_dur = max(0.01, end - start)
 
+        # 检测旁白时长，如果旁白 > 视频时长则自动延长最后一帧
+        narr_dur = _get_wav_duration_sec(narration_audio) if narration_audio else None
         if render_type == "slow_mo":
             speed = float(segment.get("speed", 0.5))
             if speed <= 0:
                 speed = 0.5
             out_dur = clip_dur / speed
+            extend_dur = 0.0
+            # 如果旁白更长，计算需要延长的时长
+            if narr_dur is not None and narr_dur > out_dur:
+                extend_dur = narr_dur - out_dur + 0.3
+                out_dur = narr_dur + 0.3
+                logger.info(
+                    "slow_mo segment %s: extending last frame by %.3fs to fit narration %.3fs",
+                    prefix,
+                    extend_dur,
+                    narr_dur,
+                )
             v_chain = f"{base_vf}," if base_vf else ""
             v_chain += f"setpts=(PTS-STARTPTS)*(1/{speed})"
+            # 如果需要延长，添加 tpad 滤镜延长最后一帧
+            if extend_dur > 0:
+                v_chain += f",tpad=stop_mode=clone:stop_duration={extend_dur:.3f}"
             filter_complex = f"[0:v]{v_chain}[vout];[0:a]asetpts=PTS-STARTPTS,atempo={speed}[aout]"
             _run_ffmpeg(
                 [
@@ -1096,8 +1132,58 @@ def _build_segment_video(
             )
             seg_duration = float(out_dur)
         else:
-            _run_ffmpeg(
-                [
+            # overdub / pure_audio: 检测旁白时长
+            target_dur = clip_dur
+            extend_dur = 0.0
+            if narr_dur is not None and narr_dur > clip_dur:
+                extend_dur = narr_dur - clip_dur + 0.3
+                target_dur = narr_dur + 0.3
+                logger.info(
+                    "overdub segment %s: extending last frame by %.3fs to fit narration %.3fs",
+                    prefix,
+                    extend_dur,
+                    narr_dur,
+                )
+            # 构建 video filter，如果需要延长则添加 tpad
+            v_filter_parts = []
+            if vf_args and "-vf" in vf_args:
+                v_filter_parts.append(vf_args[vf_args.index("-vf") + 1])
+            if extend_dur > 0:
+                v_filter_parts.append(f"tpad=stop_mode=clone:stop_duration={extend_dur:.3f}")
+            
+            if v_filter_parts:
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-ss",
+                    f"{start:.3f}",
+                    "-accurate_seek",
+                    "-i",
+                    video_path,
+                    "-t",
+                    f"{clip_dur:.3f}",
+                    "-vf",
+                    ",".join(v_filter_parts),
+                    "-r",
+                    str(fps_int),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "fast",
+                    "-crf",
+                    "18",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    seg_base,
+                ]
+            else:
+                ffmpeg_cmd = [
                     "ffmpeg",
                     "-y",
                     "-ss",
@@ -1126,8 +1212,8 @@ def _build_segment_video(
                     "make_zero",
                     seg_base,
                 ]
-            )
-            seg_duration = float(clip_dur)
+            _run_ffmpeg(ffmpeg_cmd)
+            seg_duration = float(target_dur)
 
         if render_type == "pure_audio":
             _run_ffmpeg(["ffmpeg", "-y", "-i", seg_base, "-c", "copy", seg_output])
@@ -1528,6 +1614,19 @@ def _build_segment_video(
 
     seg_duration = float(pre_duration + freeze_duration + post_duration)
     if narration_audio and os.path.exists(narration_audio) and narration_text:
+        duck_exclude_ranges = None
+        if freeze_effect_engine is not None:
+            try:
+                stinger_cfg = freeze_effect_engine.config.stinger
+                if stinger_cfg.enabled:
+                    stinger_dur = float(stinger_cfg.duration_ms) / 1000.0
+                    if stinger_dur <= 0:
+                        stinger_dur = 0.8
+                    stinger_start = pre_duration
+                    stinger_end = min(pre_duration + stinger_dur, pre_duration + freeze_duration)
+                    duck_exclude_ranges = [(stinger_start, stinger_end)]
+            except Exception:
+                duck_exclude_ranges = None
         try:
             narration_offset = float(os.environ.get("AUTOCUT_NARRATION_OFFSET", f"{pre_duration:.3f}"))
         except Exception:
@@ -1545,6 +1644,7 @@ def _build_segment_video(
             tmp_dir,
             bg_duck_db=bg_duck_db,
             mute_bg_when_tts=False,
+            duck_exclude_ranges=duck_exclude_ranges,
         )
         _run_ffmpeg(
             [
@@ -1743,7 +1843,7 @@ def _build_portrait_vf_args(render: Optional[Dict[str, Any]]) -> List[str]:
 
     # Strategy: scale to target width while preserving aspect ratio, then
     # pad to the desired height (letterbox) and center vertically.
-    vf = f"scale={width}:-2,pad={width}:{height}:0:(oh-ih)/2:black"
+    vf = f"scale={width}:-2,pad={width}:{height}:0:floor((oh-ih)/2):black"
     return ["-vf", vf]
 
 

@@ -76,6 +76,8 @@ class StingerConfig:
     frequency: int = 1800
     gain_db: float = -6.0
     fade_out_ms: int = 80
+    profile: str = "sine"
+    file_path: str = ""
 
 
 @dataclass
@@ -120,6 +122,8 @@ class EffectConfig:
                 "frequency": self.stinger.frequency,
                 "gain_db": self.stinger.gain_db,
                 "fade_out_ms": self.stinger.fade_out_ms,
+                "profile": self.stinger.profile,
+                "file_path": self.stinger.file_path,
             },
         }
 
@@ -215,14 +219,43 @@ class FreezeEffectEngine:
             return ""
 
         s = self.config.stinger
+        fade_out_dur = s.fade_out_ms / 1000.0
+
+        gain_linear = math.pow(10, s.gain_db / 20.0)
+
+        if (s.profile or "").strip().lower() == "file" and s.file_path:
+            file_path = s.file_path
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(os.getcwd(), file_path)
+            if os.path.exists(file_path):
+                file_path = file_path.replace("\\", "\\\\").replace("'", "\\'")
+                stinger_dur = s.duration_ms / 1000.0
+                if stinger_dur > 0:
+                    fade_out_dur = min(fade_out_dur, stinger_dur)
+                    return (
+                        f"amovie='{file_path}',"
+                        f"atrim=0:{stinger_dur},"
+                        f"asetpts=PTS-STARTPTS,"
+                        f"afade=t=out:st={stinger_dur - fade_out_dur}:d={fade_out_dur},"
+                        f"volume={gain_linear:.4f}"
+                    )
+                return f"amovie='{file_path}',asetpts=PTS-STARTPTS,volume={gain_linear:.4f}"
+
         stinger_dur = s.duration_ms / 1000.0
         if stinger_dur <= 0:
             return ""
 
-        fade_out_dur = s.fade_out_ms / 1000.0
         sine_dur = min(stinger_dur, duration * 0.5)
 
-        gain_linear = math.pow(10, s.gain_db / 20.0)
+        if (s.profile or "").strip().lower() == "camera_old":
+            noise_dur = sine_dur
+            fade_out_dur = min(fade_out_dur, noise_dur)
+            return (
+                f"anoisesrc=d={noise_dur}:c=white,"
+                f"bandpass=f={s.frequency}:w=2000,"
+                f"afade=t=out:st={noise_dur - fade_out_dur}:d={fade_out_dur},"
+                f"volume={gain_linear:.4f}"
+            )
 
         return (
             f"sine=f={s.frequency}:d={sine_dur},"
@@ -294,8 +327,8 @@ class FreezeEffectEngine:
             total_frames = max(1, int(round(freeze_duration * fps)))
             step = zoom_delta / float(total_frames)
             z_expr = f"min({z.start_zoom}+{step}*on,{z.end_zoom})"
-            x_expr = "iw/2-(iw/zoom/2)"
-            y_expr = "ih/2-(ih/zoom/2)"
+            x_expr = "floor(iw/2-(iw/zoom/2))"
+            y_expr = "floor(ih/2-(ih/zoom/2))"
             return (
                 f"[0:v]zoompan="
                 f"z='{z_expr}'"
