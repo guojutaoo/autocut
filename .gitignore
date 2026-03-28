@@ -102,5 +102,4 @@ tests/__pycache__/
 htmlcov/
 
 # Trae specific (keep documents but ignore other generated files)
-.trae/skills/
 .trae/specs/
