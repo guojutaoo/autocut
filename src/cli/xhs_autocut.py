@@ -61,6 +61,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--video", required=True, help="Path to input video file")
     parser.add_argument("--subtitle", help="Path to input subtitle file (optional, defaults to same name as video)")
     parser.add_argument("--out", required=True, help="Output directory for XHS assets")
+    parser.add_argument(
+        "--transcribe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When subtitle is missing, try ASR transcription (requires ffmpeg).",
+    )
+    parser.add_argument(
+        "--faces-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Only dump detected faces for inspection, then exit.",
+    )
+    parser.add_argument(
+        "--faces-sample-sec",
+        type=float,
+        default=3.0,
+        help="Sampling interval in seconds for --faces-only.",
+    )
 
     parser.add_argument(
         "--target-duration",
@@ -119,6 +137,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Freeze effect preset name: 'weibo_pop', 'cinematic', 'dramatic', 'subtle', or 'none'. "
             "When set, applies white flash + zoom-in + stinger audio to all freeze segments."
         ),
+    )
+    parser.add_argument(
+        "--dump-faces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Dump detected face crops and boxed frames for inspection.",
     )
     return parser
 
@@ -676,12 +700,290 @@ def main(argv: Any = None) -> None:
     skip_end = float(args.skip_end)
     render_now = bool(args.render)
     freeze_effect = args.freeze_effect
+    faces_only = bool(getattr(args, "faces_only", False))
+    faces_sample_sec = float(getattr(args, "faces_sample_sec", 3.0) or 3.0)
 
     if not os.path.exists(video_path):
         logger.error("Input video does not exist: %s", video_path)
         raise SystemExit(1)
 
     os.makedirs(out_dir, exist_ok=True)
+
+    if faces_only:
+        import cv2
+        from ..ingestion.ingestor import read_video_frames
+        from ..vision.face_emotion import dbscan_cosine, detect_faces_on_frame, default_min_quality_to_update, estimate_face_quality
+
+        fps = 30.0
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if cap.isOpened():
+                fps_val = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                if fps_val > 0.1:
+                    fps = fps_val
+            cap.release()
+        except Exception:
+            pass
+
+        stride = max(1, int(round(fps * max(0.1, faces_sample_sec))))
+        dump_dir = os.path.join(out_dir, "faces", "all_frames")
+        os.makedirs(dump_dir, exist_ok=True)
+        crops_dir = os.path.join(dump_dir, "crops")
+        os.makedirs(crops_dir, exist_ok=True)
+
+        dets = []
+        embs = []
+        emb_det_indices = []
+        min_q = float(default_min_quality_to_update() or 0.0)
+
+        det_idx = 0
+        for ts, frame in read_video_frames(video_path, frame_stride=stride):
+            if ts < skip_start:
+                continue
+            if skip_end > 0:
+                dur = _get_video_duration(video_path)
+                if dur > 0 and ts > max(0.0, dur - skip_end):
+                    break
+            faces = detect_faces_on_frame(frame, max_faces=5)
+            for f in faces:
+                bbox = f.get("bbox") or []
+                if not (isinstance(bbox, list) and len(bbox) == 4):
+                    continue
+                x, y, w, h = [int(v) for v in bbox]
+                if w <= 0 or h <= 0:
+                    continue
+                x0 = max(0, min(x, frame.shape[1] - 1))
+                y0 = max(0, min(y, frame.shape[0] - 1))
+                x1 = max(0, min(x + w, frame.shape[1]))
+                y1 = max(0, min(y + h, frame.shape[0]))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                crop = frame[y0:y1, x0:x1]
+                face_path = os.path.join(crops_dir, f"det_{det_idx:06d}.jpg")
+                cv2.imwrite(face_path, crop)
+                area = int((x1 - x0) * (y1 - y0))
+                q = estimate_face_quality(crop, area=area, det_score=f.get("score"))
+                rec = {
+                    "t_sec": float(ts),
+                    "frame_index": int(round(float(ts) * fps)),
+                    "face_path": face_path,
+                    "bbox": [int(x0), int(y0), int(x1 - x0), int(y1 - y0)],
+                    "score": f.get("score"),
+                    "backend": f.get("backend"),
+                    "quality": float(q),
+                    "person_id": f"u{det_idx:06d}",
+                }
+                dets.append(rec)
+                emb = f.get("embedding")
+                if emb is not None:
+                    try:
+                        import numpy as np
+
+                        v = np.asarray(emb, dtype="float32")
+                        if v.ndim == 1 and v.shape[0] >= 128:
+                            if float(q) >= min_q:
+                                embs.append(v)
+                                emb_det_indices.append(det_idx)
+                    except Exception:
+                        pass
+                det_idx += 1
+
+        eps = float(os.environ.get("AUTOCUT_DBSCAN_EPS") or "0.32")
+        min_samples = int(os.environ.get("AUTOCUT_DBSCAN_MIN_SAMPLES") or "4")
+        labels = dbscan_cosine(embs, eps=eps, min_samples=min_samples)
+        cluster_to_pid = {}
+        cluster_counts = {}
+        for lab in labels:
+            if lab >= 0:
+                cluster_counts[lab] = cluster_counts.get(lab, 0) + 1
+        for i, lab in enumerate(sorted(cluster_counts.keys(), key=lambda k: cluster_counts[k], reverse=True)):
+            cluster_to_pid[lab] = f"p{i+1:02d}"
+
+        for idx_in_embs, det_i in enumerate(emb_det_indices):
+            lab = labels[idx_in_embs] if idx_in_embs < len(labels) else -1
+            pid = cluster_to_pid.get(lab)
+            if pid is None:
+                pid = f"u{det_i:06d}"
+            dets[det_i]["person_id"] = pid
+
+        index_path = os.path.join(dump_dir, "index.jsonl")
+        with open(index_path, "w", encoding="utf-8") as fp:
+            for r in dets:
+                fp.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        logger.info("Face dump completed: %s", dump_dir)
+        return
+
+    if from_plan:
+
+
+        # ===========================
+        # 【LLM 文案驱动渲染模式】
+        # ===========================
+        #
+        # 这是本仓库"LLM 文案 -> 成片"的主入口：
+        # 1) LLM 输出 JSON 计划（通常是 outputs/.../video_script_expert_output.json）
+        #    包含每段时间戳 + render_type + narration_text（+ 可选 freeze_duration）
+        # 2) 本分支读取该 JSON，为每段合成 TTS 音频（pure_audio 除外），
+        #    然后将计划翻译成 ffmpeg 渲染器能理解的 "compose_segments" 结构
+        # 3) 最后调用 compose_segments_xhs(...)，逐段渲染为 mp4 并拼接成
+        #    outputs/.../compose.mp4
+        #
+        # 链路中的关键文件：
+        # - LLM 计划消费/编排：src/cli/xhs_autocut.py（本块）
+        # - 片段渲染（裁剪/定格/慢放/叠字幕/混音）：src/render/ffmpeg_compose.py
+        # - TTS 合成：src/tts/tts_edge.py
+        if not os.path.exists(from_plan):
+            logger.error("Plan file not found: %s", from_plan)
+            raise SystemExit(1)
+        
+        with open(from_plan, 'r', encoding='utf-8') as f:
+            plan_data = json.load(f)
+
+            print('plan_data', plan_data)
+
+        
+        logger.info("Rendering from plan: %s", from_plan)
+        plan_video = plan_data.get("source_video")
+
+        print('plan_video',plan_video)
+        if plan_video and os.path.exists(str(plan_video)):
+            if os.path.abspath(str(plan_video)) != os.path.abspath(video_path):
+                logger.warning(
+                    "Plan source_video differs from --video; using plan source_video: %s",
+                    plan_video,
+                )
+            video_path = str(plan_video)
+
+
+        try:
+            transcript_path = plan_data.get("full_transcript_path") or os.path.join(out_dir, "transcript_for_llm.txt")
+            if transcript_path and os.path.exists(transcript_path):
+                _audit_llm_script_segments(plan_data.get("segments", []), transcript_path, out_dir)
+        except Exception:
+            pass
+        
+        # 1) 从计划中重建片段数据
+        # "segments_data" 是 LLM 输出（或后处理过的计划），包含：
+        # - start/end: 源视频中的绝对时间戳
+        # - anchor_time: [start,end] 区间内的关键时刻（定格聚焦或解析点）
+        # - render_type: freeze / overdub / slow_mo / pure_audio
+        # - narration_text: 该片段的解说文案（pure_audio 时为空）
+        #
+        # 保持此列表不变，构建并行的音频/文本数组，按索引对齐。
+        segments_data = plan_data.get("segments", [])
+        narration_texts = [s["narration_text"] for s in segments_data]
+        
+        # 2) 合成旁白音频
+        # 对每个片段：
+        # - 如果 render_type 是 pure_audio 或 narration_text 为空 -> 不生成 TTS
+        # - 否则在 outputs/.../narrations/narration_XX.wav 合成 wav 文件
+        #
+        # 注意：freeze_durations 主要用于 render_type=freeze（定格持续多久）
+        narration_audios: List[Optional[str]] = []
+        freeze_durations: List[float] = []
+        narr_dir = os.path.join(out_dir, "narrations")
+        os.makedirs(narr_dir, exist_ok=True)
+        
+        for idx, text in enumerate(narration_texts):
+            rt = str(segments_data[idx].get("render_type") or "freeze").strip().lower()
+            if rt == "pure_audio" or not str(text or "").strip():
+                narration_audios.append(None)
+                freeze_durations.append(0.0)
+                continue
+
+            out_path = os.path.join(narr_dir, f"narration_{idx:02d}.wav")
+            audio_path = synthesize(text=text, out_path=out_path)
+            narration_audios.append(audio_path)
+            dur = _get_wav_duration_sec(audio_path) or 0.5
+            freeze = max(1.0, min(60.0, dur + 0.1))
+            freeze_durations.append(freeze)
+            logger.info("Narration %02d: audio=%s, dur=%.3fs -> freeze=%.3fs", idx, audio_path, dur, freeze)
+            
+        # 3) 构建合成片段
+        # 将 LLM 计划翻译成渲染器友好的字典格式
+        #
+        # 支持两种格式：
+        # - 非定格样式（overdub / slow_mo / pure_audio）：
+        #   渲染器期望：{start,end,render_type,(speed)}
+        # - 定格样式：
+        #   渲染器期望：{pre:{start,duration}, freeze:{time,duration}, post:{start,duration}}
+        #
+        # 重要：start/end/anchor_time 保持为*源视频*的绝对时间
+        compose_segments = []
+        for idx, s in enumerate(segments_data):
+            start = float(s.get("start", 0.0))
+            end = float(s.get("end", start + 5.0))
+            
+            anchor = float(s.get("anchor_time", end))
+            if anchor < start:
+                anchor = start
+            if anchor > end:
+                anchor = end
+            
+            rt = str(s.get("render_type") or "freeze").strip().lower()
+            if rt in ("overdub", "pure_audio", "slow_mo"):
+                seg_dict: Dict[str, Any] = {
+                    "trigger_index": idx,
+                    "trigger_time": anchor,
+                    "start": start,
+                    "end": end,
+                    "render_type": rt,
+                }
+                if rt == "slow_mo":
+                    seg_dict["speed"] = float(s.get("speed", 0.5))
+                compose_segments.append(
+                    seg_dict
+                )
+                continue
+
+            pre = {"start": start, "duration": max(0.0, anchor - start)}
+            post = {"start": anchor, "duration": max(0.0, end - anchor)}
+            freeze_dur = float(
+                s.get("freeze_duration", freeze_durations[idx] if idx < len(freeze_durations) else 1.5)
+            )
+
+            compose_segments.append(
+                {
+                    "trigger_index": idx,
+                    "trigger_time": anchor,
+                    "start": start,
+                    "end": end,
+                    "render_type": "freeze",
+                    "pre": pre,
+                    "freeze": {"time": anchor, "duration": freeze_dur},
+                    "post": post,
+                }
+            )
+            
+        # 4) 渲染
+        # render_spec 控制 9:16 缩放/裁剪行为
+        # compose_segments_xhs 是 ffmpeg "执行器"：
+        # - 将每个片段渲染为临时 mp4 文件
+        # - 叠加与旁白音频同步的字幕
+        # - 混音：压低背景音（ducking）并混入旁白音频
+        # - 将所有片段 mp4 拼接成单个 compose.mp4
+        render_spec = plan_data.get("render", {
+            "aspect": "9:16",
+            "resolution": portrait,
+            "mode": "crop_or_pad"
+        })
+        
+        logger.info("Composing highlight video from plan...")
+
+        output_video = compose_segments_xhs(
+            video_path=video_path,
+            segments=compose_segments,
+            narration_audios=narration_audios,
+            out_dir=out_dir,
+            render=render_spec,
+            output_basename="compose.mp4",
+            narration_texts=narration_texts,
+            freeze_effect=freeze_effect,
+        )
+        logger.info("Video generated at %s", output_video)
+        return
+
     # 1) 摄入：优先使用字幕，回退到视觉锚点
     subtitles = []
 
@@ -698,8 +1000,8 @@ def main(argv: Any = None) -> None:
         except Exception:
             pass
 
-    # 如果未找到字幕，尝试使用 faster-whisper 转录（借鉴自 short_video 项目）
-    if not subtitles:
+    # 如果未找到字幕，按需使用 ASR 转录
+    if not subtitles and bool(getattr(args, "transcribe", False)):
         logger.info("Subtitle file not found, attempting to transcribe video using faster-whisper...")
         try:
             # We run the transcription script as a subprocess to keep it clean
@@ -779,16 +1081,15 @@ def main(argv: Any = None) -> None:
     from ..ingestion.ingestor import get_audio_rms_profile, read_video_frames
     import cv2
     import numpy as np
-    from ..vision.face_emotion import FaceIdentityAssigner, extract_face_vision_at_time, extract_face_vision_on_frame
+    from ..vision.face_emotion import FaceIdentityAssigner, default_face_sim_margin, default_face_sim_threshold, default_min_quality_to_update, extract_face_vision_at_time, extract_face_vision_on_frame
     
     logger.info("Extracting multimodal features for transcript...")
-    audio_profile = get_audio_rms_profile(video_path)
-    visual_scores = []
-    for ts, frame in read_video_frames(video_path, frame_stride=30): # Faster sampling
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        visual_scores.append((float(np.std(gray)), ts))
+    audio_profile = None
+    visual_scores = None
 
     transcript_path = os.path.join(out_dir, "transcript_for_llm.txt")
+    face_dump_events_dir = os.path.join(out_dir, "faces", "vision_events")
+    face_dump_segments_dir = os.path.join(out_dir, "faces", "segments")
     with open(transcript_path, "w", encoding="utf-8") as f:
         fps = 30.0
         try:
@@ -802,7 +1103,11 @@ def main(argv: Any = None) -> None:
             pass
 
         stride_3s = max(1, int(round(fps * 3.0)))
-        assigner = FaceIdentityAssigner()
+        assigner = FaceIdentityAssigner(
+            sim_threshold=default_face_sim_threshold(),
+            sim_margin=default_face_sim_margin(),
+            min_quality_to_update=default_min_quality_to_update(),
+        )
         last_sig = None
         f.write("# Vision Events (3s sampling, only on change)\n")
         try:
@@ -811,7 +1116,13 @@ def main(argv: Any = None) -> None:
                     continue
                 if ts > valid_end:
                     break
-                vision = extract_face_vision_on_frame(frame, assigner)
+                vision = extract_face_vision_on_frame(
+                    frame,
+                    assigner,
+                    debug_out_dir=face_dump_events_dir if args.dump_faces else None,
+                    debug_prefix="evt",
+                    t_sec=float(ts),
+                )
                 face_count = int(vision.get("face_count", 0) or 0)
                 people = vision.get("people_in_shot") or []
                 if not isinstance(people, list):
@@ -826,6 +1137,11 @@ def main(argv: Any = None) -> None:
             pass
         f.write("\n")
         if subtitles:
+            audio_profile = get_audio_rms_profile(video_path)
+            visual_scores = []
+            for ts, frame in read_video_frames(video_path, frame_stride=30):
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                visual_scores.append((float(np.std(gray)), ts))
             for sub in subtitles:
                 start_ts = f"{sub.start // 3600:02.0f}:{(sub.start % 3600) // 60:02.0f}:{sub.start % 60:06.3f}".replace('.', ',')
                 end_ts = f"{sub.end // 3600:02.0f}:{(sub.end % 3600) // 60:02.0f}:{sub.end % 60:06.3f}".replace('.', ',')
@@ -836,6 +1152,66 @@ def main(argv: Any = None) -> None:
             # (Fallback logic already handles segments generation below)
                 
     logger.info("Multimodal transcript written to %s", transcript_path)
+
+    # Always generate a plan for LLM feeding first
+    transcript_entries = _parse_transcript_entries(transcript_path)
+    plan_segments = []
+    face_assigner = FaceIdentityAssigner(
+        sim_threshold=default_face_sim_threshold(),
+        sim_margin=default_face_sim_margin(),
+        min_quality_to_update=default_min_quality_to_update(),
+    )
+    face_cap = cv2.VideoCapture(video_path)
+    for i, seg in enumerate(segments):
+        mid = (float(seg.start) + float(seg.end)) / 2.0
+        if mid < valid_start or mid > valid_end:
+            vision = {"faces": [], "face_count": 0, "people_in_shot": []}
+        else:
+            vision = (
+                extract_face_vision_at_time(
+                    face_cap,
+                    mid,
+                    face_assigner,
+                    debug_out_dir=face_dump_segments_dir if args.dump_faces else None,
+                    debug_prefix=f"seg_{i:03d}",
+                )
+                if face_cap.isOpened()
+                else {"faces": [], "face_count": 0, "people_in_shot": []}
+            )
+        transcript_window = _build_transcript_window(
+            transcript_entries,
+            start=float(seg.start),
+            end=float(seg.end),
+            window_sec=10.0,
+            max_lines=24,
+        )
+        plan_segments.append({
+            "index": i,
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "score": float(seg.score),
+            "selection_reason": _get_selection_reason(seg),
+            "subtitle_texts": [line.text for line in seg.lines],
+            "narration_text": generate_narration(seg, title_prefix=title_prefix or None),
+            "vision": vision,
+            "transcript_window": transcript_window,
+        })
+    try:
+        face_cap.release()
+    except Exception:
+        pass
+    
+    light_plan = {
+        "source_video": os.path.abspath(video_path),
+        "segments": plan_segments,
+        "full_transcript_path": os.path.abspath(transcript_path)
+    }
+    
+    plan_path = os.path.join(out_dir, "compose_plan.json")
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(light_plan, f, ensure_ascii=False, indent=2)
+        
+    logger.info("Segmentation plan for LLM written to %s", plan_path)
 
     if not render_now:
         logger.info("Screening mode completed (no --render flag).")
