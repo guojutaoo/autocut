@@ -2,8 +2,9 @@
 VIDEO_PATH="/Users/bytedance/Downloads/01.mp4"
 OUT_DIR="outputs/autocut_project"
 
-# Base command
-# It will automatically check for 01.srt or transcribe if missing
+export AUTOCUT_ASR_MODEL="tiny"
+export AUTOCUT_ASR_LANG="zh"
+
 python3 -m src.cli.xhs_autocut \
   --video "$VIDEO_PATH" \
   --out "$OUT_DIR" \
@@ -12,4 +13,5 @@ python3 -m src.cli.xhs_autocut \
   --title-prefix '雍正王朝权谋解析' \
   --hashtags '#雍正王朝 #权谋 #历史' \
   --skip-start 60 \
-  --skip-end 60
+  --skip-end 60 \
+  --verbose

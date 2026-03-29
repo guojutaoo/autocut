@@ -54,8 +54,16 @@ def write_text(path: str, content: str, encoding: str) -> None:
 
 def extract_audio_wav(input_video: str, out_wav: str) -> None:
     ensure_dir(os.path.dirname(out_wav))
+    ffmpeg_exe = os.environ.get("AUTOCUT_FFMPEG", "").strip()
+    if not ffmpeg_exe:
+        try:
+            import imageio_ffmpeg  # type: ignore
+
+            ffmpeg_exe = str(imageio_ffmpeg.get_ffmpeg_exe() or "").strip()
+        except Exception:
+            ffmpeg_exe = "ffmpeg"
     cmd = [
-        "ffmpeg",
+        ffmpeg_exe,
         "-y",
         "-i",
         input_video,

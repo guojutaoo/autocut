@@ -1011,27 +1011,54 @@ def main(argv: Any = None) -> None:
             
             if os.path.exists(transcribe_script):
                 import subprocess
+                import sys
                 base_name = os.path.splitext(os.path.basename(video_path))[0]
                 # Output to a subdirectory in out_dir
                 transcribe_out = os.path.join(out_dir, "transcription")
                 os.makedirs(transcribe_out, exist_ok=True)
-                
-                subprocess.run([
-                    "python3", transcribe_script,
-                    "--input", video_path,
-                    "--out-dir", transcribe_out,
-                    "--model", "small",
-                    "--language", "zh"
-                ], check=True)
+
+                ffmpeg_exe = ""
+                try:
+                    import imageio_ffmpeg  # type: ignore
+
+                    ffmpeg_exe = str(imageio_ffmpeg.get_ffmpeg_exe() or "").strip()
+                except Exception:
+                    ffmpeg_exe = ""
+                if ffmpeg_exe:
+                    os.environ["AUTOCUT_FFMPEG"] = ffmpeg_exe
+
+                subprocess.run(
+                    [
+                        sys.executable,
+                        transcribe_script,
+                        "--input",
+                        video_path,
+                        "--out-dir",
+                        transcribe_out,
+                        "--model",
+                        str(os.environ.get("AUTOCUT_ASR_MODEL", "small") or "small"),
+                        "--language",
+                        str(os.environ.get("AUTOCUT_ASR_LANG", "zh") or "zh"),
+                    ],
+                    check=True,
+                )
                 
                 new_srt = os.path.join(transcribe_out, f"{base_name}.srt")
                 if os.path.exists(new_srt):
                     subtitles = load_subtitles_for_video(new_srt)
                     logger.info("Transcription completed successfully.")
             else:
-                logger.warning("Transcription script not found at: %s", transcribe_script)
+                logger.error("Transcription script not found at: %s", transcribe_script)
+                raise SystemExit(2)
         except Exception as e:
-            logger.warning("Transcription failed: %s. Falling back to visual anchors.", e)
+            logger.error(
+                "Transcription failed: %s. Please provide --subtitle (SRT) or install ASR deps (requirements.asr.txt).",
+                e,
+            )
+            raise SystemExit(2)
+        if not subtitles:
+            logger.error("No subtitles available after transcription. Please provide --subtitle or fix ASR environment.")
+            raise SystemExit(2)
 
     keywords = _load_keywords_for_scoring()
 
@@ -1185,33 +1212,65 @@ def main(argv: Any = None) -> None:
             window_sec=10.0,
             max_lines=24,
         )
-        plan_segments.append({
-            "index": i,
-            "start": float(seg.start),
-            "end": float(seg.end),
-            "score": float(seg.score),
-            "selection_reason": _get_selection_reason(seg),
-            "subtitle_texts": [line.text for line in seg.lines],
-            "narration_text": generate_narration(seg, title_prefix=title_prefix or None),
-            "vision": vision,
-            "transcript_window": transcript_window,
-        })
+        plan_segments.append(
+            {
+                "index": i,
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "score": float(seg.score),
+                "selection_reason": _get_selection_reason(seg),
+                "subtitle_texts": [line.text for line in seg.lines],
+                "narration_text": generate_narration(seg, title_prefix=title_prefix or None),
+                "vision": vision,
+                "transcript_window": transcript_window,
+            }
+        )
     try:
         face_cap.release()
     except Exception:
         pass
-    
+
     light_plan = {
         "source_video": os.path.abspath(video_path),
         "segments": plan_segments,
-        "full_transcript_path": os.path.abspath(transcript_path)
+        "full_transcript_path": os.path.abspath(transcript_path),
     }
-    
+
     plan_path = os.path.join(out_dir, "compose_plan.json")
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(light_plan, f, ensure_ascii=False, indent=2)
-        
+
     logger.info("Segmentation plan for LLM written to %s", plan_path)
+
+    try:
+        import subprocess
+        import sys
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        exporter = os.path.join(project_root, "scripts", "export_for_llm.py")
+        llm_input_dir = os.path.join(out_dir, "llm_input")
+        if os.path.exists(exporter):
+            extract_frames = str(os.environ.get("AUTOCUT_EXPORT_FRAMES", "0")).strip().lower() in {"1", "true"}
+            cmd = [
+                sys.executable,
+                exporter,
+                "--transcript",
+                transcript_path,
+                "--video",
+                video_path,
+                "--out",
+                llm_input_dir,
+                "--gap-threshold",
+                str(gap_threshold),
+                "--context-window",
+                "30.0",
+            ]
+            if not extract_frames:
+                cmd.append("--no-frames")
+            subprocess.run(cmd, check=False)
+            logger.info("LLM input files exported to %s", llm_input_dir)
+    except Exception:
+        pass
 
     if not render_now:
         logger.info("Screening mode completed (no --render flag).")
