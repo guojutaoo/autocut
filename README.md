@@ -149,7 +149,7 @@ python tests/test_fusion_basic.py  # 简单运行示例测试
 
 - **ffmpeg**：
   - 若系统 PATH 中存在 `ffmpeg`，`compose` CLI 会实际调用 ffmpeg 生成 `compose.mp4`；
-  - 若未安装 `ffmpeg`，则只会在 `--out` 目录下生成 `compose_plan.json`（描述切片、定格、ducking 等计划），便于在无 ffmpeg 的环境中完成调试与联调。
+  - 若未安装 `ffmpeg`，则无法生成 `compose.mp4`。
 - **edge-tts（可选）**：
   - 当已安装 `edge-tts` 且环境可访问对应服务时，`src.tts.tts_edge.synthesize` 会生成真实 TTS 旁白音频；
   - 当未安装或无法访问服务时，会自动回退为一段 0.5s 静音 WAV，以保证流水线在离线环境下也能完整跑通。
@@ -179,7 +179,6 @@ python -m src.cli.compose \
 
 输出说明：
 
-- `outputs/final_demo/compose_plan.json`：合成计划 JSON（无 ffmpeg 时也会生成）；
 - `outputs/final_demo/compose.mp4`：当 ffmpeg 可用时生成的合成成片。
 
 ### 目标时长调度（示例：5 分钟）
@@ -196,14 +195,7 @@ python -m src.cli.compose \
   --target-duration 300
 ```
 
-此时：
-
-- `compose_plan.json` 中会额外包含：
-  - `target_duration_sec`：目标时长（例如 300）；
-  - `narration_duration_sec`：旁白音频时长（仅在 WAV 文件可用时会填写）；
-  - `total_planned_duration_sec`：按片段累计后的总时长。
-- 片段会按触发时间顺序累计，直到接近目标时长，最后一段的 `post` 可能被自动缩短以贴合目标。
-- 当素材本身不足（例如示例视频只有约 6 秒）时，总时长会明显小于目标值，即“受素材限制”，依然会生成 `compose_plan.json` 和 `narration.wav` 供联调与检查。
+此时片段会按触发时间顺序累计，直到接近目标时长，最后一段的 `post` 可能被自动缩短以贴合目标。
 
 另外，`configs/compose_5min.yaml` 提供了一个只包含 `target_duration_sec: 300` 的配置样例，方便在项目或上层编排中约定目标时长。
 
@@ -230,16 +222,12 @@ python -m src.cli.xhs_autocut \
   - 未安装或网络不可用时，会自动回退到 0.5 秒静音 WAV，占位不影响整体流程跑通。
 - **ffmpeg（可选）**：
   - 已安装时，会实际调用 ffmpeg 生成竖屏 9:16 成片 `compose_xhs.mp4`；
-  - 未安装时，只生成脚本化的 `compose_plan_xhs.json` + 音频/封面/文案等素材，方便在其它环境或剪辑软件中复现同样的剪辑逻辑。
+  - 未安装时，无法生成 `compose_xhs.mp4`，但仍会产出音频/封面/文案等素材。
 
 ### 输出产物结构示例
 
 以上命令运行完成后，`--out` 目录（示例为 `outputs/xhs_demo`）下会包含：
 
-- `compose_plan_xhs.json`：
-  - 含 9:16 渲染计划（`render: {aspect: "9:16", resolution: "1080x1920", mode: "crop_or_pad"}`）；
-  - 每个故事段的时间范围、锚点时间、关键词得分、对应旁白音频路径等信息；
-  - 若 ffmpeg 可用，还会记录实际生成的视频路径 `compose_xhs.mp4`。
 - `compose_xhs.mp4`（仅在安装了 ffmpeg 的机器上生成）：
   - 已按 9:16 竖屏裁剪/缩放的合成成片，包含“剧情 + 定格 + 旁白叠加”的高光串联。
 - `cover.jpg`：
@@ -258,9 +246,9 @@ python -m src.cli.xhs_autocut \
 2. 在小红书创建新笔记，上传 `compose_xhs.mp4` 作为视频内容；
 3. 在封面选择界面，上传或选择本目录下的 `cover.jpg` 作为封面图；
 4. 打开 `xhs_caption.txt` 或 `caption.txt`，将标题、话题和摘要按需复制到小红书的标题和正文区域，可根据平台字数限制做少量微调；
-5. 如需二次精修旁白或加字幕，可在剪辑软件中根据 `compose_plan_xhs.json` 中的时间轴和 `narration_*.wav` 做进一步包装，再导出上传。
+5. 如需二次精修旁白或加字幕，可在剪辑软件中基于 `narration_*.wav` 做进一步包装，再导出上传。
 
-通过这一入口，你可以在**一条命令**下获得一整套“小红书可发片”的核心素材，在无 ffmpeg / edge-tts 的环境中也会自动退化为“合成计划 + 静音旁白 + 封面 + 文案”的形态，保证链路始终可跑通。
+通过这一入口，你可以在**一条命令**下获得一整套“小红书可发片”的核心素材，在无 ffmpeg / edge-tts 的环境中也会自动退化为“静音旁白 + 封面 + 文案”的形态，保证链路始终可跑通。
 
 ## 已知限制
 

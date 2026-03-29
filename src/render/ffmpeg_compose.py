@@ -70,13 +70,11 @@ class ComposeResult:
         out_dir: Output directory used for artifacts.
         ffmpeg_available: Whether ffmpeg was detected and used.
         output_video: Path to the generated ``compose.mp4`` if any.
-        plan_path: Path to the JSON compose plan.
     """
 
     out_dir: str
     ffmpeg_available: bool
     output_video: Optional[str]
-    plan_path: str
 
 
 def _has_ffmpeg() -> bool:
@@ -400,14 +398,6 @@ def _build_segments(
         break
 
     return selected
-
-
-def _save_plan(plan: Dict[str, Any], out_dir: str) -> str:
-    os.makedirs(out_dir, exist_ok=True)
-    plan_path = os.path.join(out_dir, "compose_plan.json")
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
-    return plan_path
 
 
 def _run_ffmpeg(cmd: Sequence[str]) -> None:
@@ -1744,7 +1734,7 @@ def _execute_plan(
             shutil.rmtree(tmp_dir)
         return compose_path
     except Exception as exc:  # pragma: no cover - runtime / ffmpeg errors
-        logger.error("Failed to execute compose plan via ffmpeg: %s", exc)
+        logger.error("Failed to compose via ffmpeg: %s", exc)
         return None
 
 
@@ -1757,9 +1747,7 @@ def compose_from_triggers(
 ) -> ComposeResult:
     """Compose a highlight reel from triggers and an input video.
 
-    This function always writes ``compose_plan.json`` into ``out_dir``.
-    当 ``ffmpeg`` 可用时，会尝试根据该计划生成 ``compose.mp4``，否则仅输出
-    计划文件，方便在无 ffmpeg 环境中完成调试与联调。可选的
+    当 ``ffmpeg`` 可用时，会根据 triggers 生成 ``compose.mp4``。可选的
     ``target_duration_sec`` 会被用于在构造片段时进行“目标时长调度”。
     """
 
@@ -1781,40 +1769,21 @@ def compose_from_triggers(
         target_value > 0.0 and total_planned < target_value * 0.9
     )
 
-    plan: Dict[str, Any] = {
-        "source_video": os.path.abspath(video_path),
-        "triggers_path": os.path.abspath(triggers_path),
-        "narration_audio": os.path.abspath(narration_audio)
-        if narration_audio
-        else None,
-        "narration_duration_sec": narr_dur,
-        "target_duration_sec": target_value,
-        "total_planned_duration_sec": total_planned,
-        "duration_limited_by_source": duration_limited,
-        "ffmpeg_available": ffmpeg_available,
-        "segments": segments,
-    }
-
-    plan_path = _save_plan(plan, out_dir)
-
     output_video: Optional[str] = None
     if ffmpeg_available:
-        logger.info("ffmpeg detected on PATH, executing compose plan...")
+        logger.info("ffmpeg detected on PATH, composing...")
         output_video = _execute_plan(video_path, narration_audio, segments, out_dir)
         if output_video:
             logger.info("Compose video generated at %s", output_video)
         else:
             logger.warning("Compose video generation failed, see logs above.")
     else:
-        logger.warning(
-            "ffmpeg not available on PATH; only compose_plan.json was generated."
-        )
+        logger.warning("ffmpeg not available on PATH; compose.mp4 could not be generated.")
 
     return ComposeResult(
         out_dir=os.path.abspath(out_dir),
         ffmpeg_available=ffmpeg_available,
         output_video=os.path.abspath(output_video) if output_video else None,
-        plan_path=os.path.abspath(plan_path),
     )
 
 

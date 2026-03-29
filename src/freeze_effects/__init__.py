@@ -9,7 +9,7 @@ Freeze Effects Module
 - 击中音效 (stinger): 短促的"咔"声
 
 使用方式：
-1. 在 compose_plan.json 或 CLI 参数中指定 effect_preset
+1. 在 CLI 参数中指定 effect_preset
 2. 效果在全局视频维度应用，所有 freeze 段共享同一动效配置
 """
 from .engine import FreezeEffectEngine, load_effect_preset

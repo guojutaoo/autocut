@@ -1,7 +1,7 @@
 """
 Freeze Effect Presets
 =====================
-预定义的动效配置，可直接在 CLI 或 compose_plan.json 中引用。
+预定义的动效配置，可直接在 CLI 中引用。
 
 每个 preset 包含：
 - white_flash: 白闪配置

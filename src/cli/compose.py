@@ -119,14 +119,10 @@ def main(argv: Any = None) -> None:
         target_duration_sec=float(getattr(args, "target_duration", 0.0)),
     )
 
-    logger.info("Compose plan written to %s", result.plan_path)
     if result.ffmpeg_available and result.output_video:
         logger.info("Compose video generated at %s", result.output_video)
     elif not result.ffmpeg_available:
-        logger.info(
-            "ffmpeg not available; only compose_plan.json was generated. "
-            "Install ffmpeg to enable actual media rendering.",
-        )
+        logger.info("ffmpeg not available; compose.mp4 could not be generated.")
     else:
         logger.warning(
             "ffmpeg was available but compose.mp4 could not be generated; "

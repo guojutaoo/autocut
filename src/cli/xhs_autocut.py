@@ -6,8 +6,8 @@ Running this module produces all key assets needed for a Xiaohongshu
 * Story segmentation based on subtitles (fallback to simple visual
   intensity anchors when no subtitles are available);
 * Per-segment Chinese narration text and TTS audio;
-* A 9:16 portrait render plan and, when ``ffmpeg`` is available,
-  an actual ``compose_xhs.mp4``;
+* A 9:16 portrait render and, when ``ffmpeg`` is available,
+  an actual ``compose_xhs.mp4`` / ``compose.mp4``;
 * A cover frame image ``cover.jpg``;
 * Caption text file ``xhs_caption.txt`` / ``caption.txt``（标题 + 话题 + 摘要）。
 
@@ -55,7 +55,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "One-shot Xiaohongshu-style auto-cut: video -> segments -> narration -> "
-            "9:16 plan and assets"
+            "9:16 assets"
         )
     )
     parser.add_argument("--video", required=True, help="Path to input video file")
@@ -111,9 +111,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--render", action="store_true", help="Perform TTS synthesis and video rendering (heavy tasks)."
-    )
-    parser.add_argument(
-        "--from-plan", help="Path to an existing compose_plan.json to render from."
     )
     parser.add_argument(
         "--freeze-effect",
@@ -678,7 +675,6 @@ def main(argv: Any = None) -> None:
     skip_start = float(args.skip_start)
     skip_end = float(args.skip_end)
     render_now = bool(args.render)
-    from_plan = args.from_plan
     freeze_effect = args.freeze_effect
 
     if not os.path.exists(video_path):
@@ -686,177 +682,6 @@ def main(argv: Any = None) -> None:
         raise SystemExit(1)
 
     os.makedirs(out_dir, exist_ok=True)
-
-    if from_plan:
-
-
-        # ===========================
-        # 【LLM 文案驱动渲染模式】
-        # ===========================
-        #
-        # 这是本仓库"LLM 文案 -> 成片"的主入口：
-        # 1) LLM 输出 JSON 计划（通常是 outputs/.../video_script_expert_output.json）
-        #    包含每段时间戳 + render_type + narration_text（+ 可选 freeze_duration）
-        # 2) 本分支读取该 JSON，为每段合成 TTS 音频（pure_audio 除外），
-        #    然后将计划翻译成 ffmpeg 渲染器能理解的 "compose_segments" 结构
-        # 3) 最后调用 compose_segments_xhs(...)，逐段渲染为 mp4 并拼接成
-        #    outputs/.../compose.mp4
-        #
-        # 链路中的关键文件：
-        # - LLM 计划消费/编排：src/cli/xhs_autocut.py（本块）
-        # - 片段渲染（裁剪/定格/慢放/叠字幕/混音）：src/render/ffmpeg_compose.py
-        # - TTS 合成：src/tts/tts_edge.py
-        if not os.path.exists(from_plan):
-            logger.error("Plan file not found: %s", from_plan)
-            raise SystemExit(1)
-        
-        with open(from_plan, 'r', encoding='utf-8') as f:
-            plan_data = json.load(f)
-
-            print('plan_data', plan_data)
-
-        
-        logger.info("Rendering from plan: %s", from_plan)
-        plan_video = plan_data.get("source_video")
-
-        print('plan_video',plan_video)
-        if plan_video and os.path.exists(str(plan_video)):
-            if os.path.abspath(str(plan_video)) != os.path.abspath(video_path):
-                logger.warning(
-                    "Plan source_video differs from --video; using plan source_video: %s",
-                    plan_video,
-                )
-            video_path = str(plan_video)
-
-
-        try:
-            transcript_path = plan_data.get("full_transcript_path") or os.path.join(out_dir, "transcript_for_llm.txt")
-            if transcript_path and os.path.exists(transcript_path):
-                _audit_llm_script_segments(plan_data.get("segments", []), transcript_path, out_dir)
-        except Exception:
-            pass
-        
-        # 1) 从计划中重建片段数据
-        # "segments_data" 是 LLM 输出（或后处理过的计划），包含：
-        # - start/end: 源视频中的绝对时间戳
-        # - anchor_time: [start,end] 区间内的关键时刻（定格聚焦或解析点）
-        # - render_type: freeze / overdub / slow_mo / pure_audio
-        # - narration_text: 该片段的解说文案（pure_audio 时为空）
-        #
-        # 保持此列表不变，构建并行的音频/文本数组，按索引对齐。
-        segments_data = plan_data.get("segments", [])
-        narration_texts = [s["narration_text"] for s in segments_data]
-        
-        # 2) 合成旁白音频
-        # 对每个片段：
-        # - 如果 render_type 是 pure_audio 或 narration_text 为空 -> 不生成 TTS
-        # - 否则在 outputs/.../narrations/narration_XX.wav 合成 wav 文件
-        #
-        # 注意：freeze_durations 主要用于 render_type=freeze（定格持续多久）
-        narration_audios: List[Optional[str]] = []
-        freeze_durations: List[float] = []
-        narr_dir = os.path.join(out_dir, "narrations")
-        os.makedirs(narr_dir, exist_ok=True)
-        
-        for idx, text in enumerate(narration_texts):
-            rt = str(segments_data[idx].get("render_type") or "freeze").strip().lower()
-            if rt == "pure_audio" or not str(text or "").strip():
-                narration_audios.append(None)
-                freeze_durations.append(0.0)
-                continue
-
-            out_path = os.path.join(narr_dir, f"narration_{idx:02d}.wav")
-            audio_path = synthesize(text=text, out_path=out_path)
-            narration_audios.append(audio_path)
-            dur = _get_wav_duration_sec(audio_path) or 0.5
-            freeze = max(1.0, min(60.0, dur + 0.1))
-            freeze_durations.append(freeze)
-            logger.info("Narration %02d: audio=%s, dur=%.3fs -> freeze=%.3fs", idx, audio_path, dur, freeze)
-            
-        # 3) 构建合成片段
-        # 将 LLM 计划翻译成渲染器友好的字典格式
-        #
-        # 支持两种格式：
-        # - 非定格样式（overdub / slow_mo / pure_audio）：
-        #   渲染器期望：{start,end,render_type,(speed)}
-        # - 定格样式：
-        #   渲染器期望：{pre:{start,duration}, freeze:{time,duration}, post:{start,duration}}
-        #
-        # 重要：start/end/anchor_time 保持为*源视频*的绝对时间
-        compose_segments = []
-        for idx, s in enumerate(segments_data):
-            start = float(s.get("start", 0.0))
-            end = float(s.get("end", start + 5.0))
-            
-            anchor = float(s.get("anchor_time", end))
-            if anchor < start:
-                anchor = start
-            if anchor > end:
-                anchor = end
-            
-            rt = str(s.get("render_type") or "freeze").strip().lower()
-            if rt in ("overdub", "pure_audio", "slow_mo"):
-                seg_dict: Dict[str, Any] = {
-                    "trigger_index": idx,
-                    "trigger_time": anchor,
-                    "start": start,
-                    "end": end,
-                    "render_type": rt,
-                }
-                if rt == "slow_mo":
-                    seg_dict["speed"] = float(s.get("speed", 0.5))
-                compose_segments.append(
-                    seg_dict
-                )
-                continue
-
-            pre = {"start": start, "duration": max(0.0, anchor - start)}
-            post = {"start": anchor, "duration": max(0.0, end - anchor)}
-            freeze_dur = float(
-                s.get("freeze_duration", freeze_durations[idx] if idx < len(freeze_durations) else 1.5)
-            )
-
-            compose_segments.append(
-                {
-                    "trigger_index": idx,
-                    "trigger_time": anchor,
-                    "start": start,
-                    "end": end,
-                    "render_type": "freeze",
-                    "pre": pre,
-                    "freeze": {"time": anchor, "duration": freeze_dur},
-                    "post": post,
-                }
-            )
-            
-        # 4) 渲染
-        # render_spec 控制 9:16 缩放/裁剪行为
-        # compose_segments_xhs 是 ffmpeg "执行器"：
-        # - 将每个片段渲染为临时 mp4 文件
-        # - 叠加与旁白音频同步的字幕
-        # - 混音：压低背景音（ducking）并混入旁白音频
-        # - 将所有片段 mp4 拼接成单个 compose.mp4
-        render_spec = plan_data.get("render", {
-            "aspect": "9:16",
-            "resolution": portrait,
-            "mode": "crop_or_pad"
-        })
-        
-        logger.info("Composing highlight video from plan...")
-
-        output_video = compose_segments_xhs(
-            video_path=video_path,
-            segments=compose_segments,
-            narration_audios=narration_audios,
-            out_dir=out_dir,
-            render=render_spec,
-            output_basename="compose.mp4",
-            narration_texts=narration_texts,
-            freeze_effect=freeze_effect,
-        )
-        logger.info("Video generated at %s", output_video)
-        return
-
     # 1) 摄入：优先使用字幕，回退到视觉锚点
     subtitles = []
 
@@ -1012,59 +837,8 @@ def main(argv: Any = None) -> None:
                 
     logger.info("Multimodal transcript written to %s", transcript_path)
 
-    # Always generate a plan for LLM feeding first
-    transcript_entries = _parse_transcript_entries(transcript_path)
-    plan_segments = []
-    face_assigner = FaceIdentityAssigner()
-    face_cap = cv2.VideoCapture(video_path)
-    for i, seg in enumerate(segments):
-        mid = (float(seg.start) + float(seg.end)) / 2.0
-        if mid < valid_start or mid > valid_end:
-            vision = {"faces": [], "face_count": 0, "people_in_shot": []}
-        else:
-            vision = (
-                extract_face_vision_at_time(face_cap, mid, face_assigner)
-                if face_cap.isOpened()
-                else {"faces": [], "face_count": 0, "people_in_shot": []}
-            )
-        transcript_window = _build_transcript_window(
-            transcript_entries,
-            start=float(seg.start),
-            end=float(seg.end),
-            window_sec=10.0,
-            max_lines=24,
-        )
-        plan_segments.append({
-            "index": i,
-            "start": float(seg.start),
-            "end": float(seg.end),
-            "score": float(seg.score),
-            "selection_reason": _get_selection_reason(seg),
-            "subtitle_texts": [line.text for line in seg.lines],
-            "narration_text": generate_narration(seg, title_prefix=title_prefix or None),
-            "vision": vision,
-            "transcript_window": transcript_window,
-        })
-    try:
-        face_cap.release()
-    except Exception:
-        pass
-    
-    light_plan = {
-        "source_video": os.path.abspath(video_path),
-        "segments": plan_segments,
-        "full_transcript_path": os.path.abspath(transcript_path)
-    }
-    
-    plan_path = os.path.join(out_dir, "compose_plan.json")
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(light_plan, f, ensure_ascii=False, indent=2)
-        
-    logger.info("Segmentation plan for LLM written to %s", plan_path)
-
     if not render_now:
         logger.info("Screening mode completed (no --render flag).")
-        logger.info("Please use full_transcript.txt and compose_plan.json for LLM feeding.")
         return
 
     # 2) Narration: per-segment text + TTS.
@@ -1082,7 +856,7 @@ def main(argv: Any = None) -> None:
     selected_freezes = [freeze_durations[i] for i in selected_indices]
     selected_narrations = [narration_texts[i] for i in selected_indices]
 
-    # 4) Build compose segments for ffmpeg and plan.
+    # 4) Build compose segments for ffmpeg.
     compose_segments = _build_compose_segments(
         selected_segments,
         selected_freezes,
@@ -1130,9 +904,7 @@ def main(argv: Any = None) -> None:
         else:
             logger.warning("ffmpeg is available but compose.mp4 could not be generated.")
     else:
-        logger.warning(
-            "ffmpeg not available; only compose_plan.json and audio assets will be generated."
-        )
+        logger.warning("ffmpeg not available; compose.mp4 could not be generated.")
 
     # 5) Cover frame.
     first_seg = selected_segments[0]
@@ -1147,54 +919,6 @@ def main(argv: Any = None) -> None:
     with open(caption_path, "w", encoding="utf-8") as f:
         f.write(caption_text)
 
-    # 7) Compose plan for XHS.
-    plan_segments: List[Dict[str, Any]] = []
-    for local_idx, idx in enumerate(selected_indices):
-        seg = segments[idx]
-        audio_path = narration_audios[idx]
-        freeze_dur = selected_freezes[local_idx]
-        comp_seg = compose_segments[local_idx]
-        text = narration_texts[idx]
-        subtitle_texts = [line.text for line in seg.lines]
-        plan_segments.append(
-            {
-                "index": local_idx,
-                "start": float(seg.start),
-                "end": float(seg.end),
-                "render_type": "freeze",
-                "anchor_time": float(comp_seg["freeze"]["time"]),
-                "score": float(seg.score),
-                "subtitle_texts": subtitle_texts,
-                "narration_text": text,
-                "narration_audio": os.path.abspath(audio_path),
-                "freeze_duration": float(freeze_dur),
-                "pre": comp_seg["pre"],
-                "freeze": comp_seg["freeze"],
-                "post": comp_seg["post"],
-            }
-        )
-
-    plan: Dict[str, Any] = {
-        "source_video": os.path.abspath(video_path),
-        "ffmpeg_available": ffmpeg_available,
-        "output_video": os.path.abspath(output_video) if output_video else None,
-        "render": render_spec,
-        "target_duration_sec": float(target_duration),
-        "segments": plan_segments,
-        "cover": {
-            "time_sec": float(cover_time),
-            "frame_path": os.path.abspath(cover_frame_path) if cover_frame_path else None,
-        },
-        "title": title,
-        "hashtags": hashtags,
-        "caption": caption_text,
-    }
-
-    plan_path = os.path.join(out_dir, "compose_plan.json")
-    with open(plan_path, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=2)
-
-    logger.info("Compose plan written to %s", plan_path)
     logger.info("Caption written to %s", caption_path)
     if cover_frame_path:
         logger.info("Cover frame written to %s", cover_frame_path)
