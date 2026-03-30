@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import re
 from collections import Counter
@@ -13,6 +14,32 @@ try:
 except Exception:
     cv2 = None  # type: ignore
     _HAS_CV2 = False
+
+try:
+    import numpy as np  # type: ignore
+
+    _HAS_NUMPY = True
+except Exception:
+    np = None  # type: ignore
+    _HAS_NUMPY = False
+
+try:
+    import jieba  # type: ignore
+    import jieba.posseg as pseg  # type: ignore
+
+    _HAS_JIEBA = True
+except Exception:
+    jieba = None  # type: ignore
+    pseg = None  # type: ignore
+    _HAS_JIEBA = False
+
+try:
+    from src.ingestion.ingestor import get_audio_rms_profile  # type: ignore
+
+    _HAS_AUDIO_PROFILE = True
+except Exception:
+    get_audio_rms_profile = None  # type: ignore
+    _HAS_AUDIO_PROFILE = False
 
 
 _TS_RE = r"\d\d:\d\d:\d\d[,.]\d\d\d"
@@ -31,6 +58,42 @@ _RE_TAG = {
     "density": re.compile(r"【台词密度：([^】]+)】"),
 }
 _RE_PXX = re.compile(r"\bp\d{2}\b")
+_RE_SPEAKER = re.compile(r"^\s*([^:：]{1,8})[:：]\s*(.+)$")
+_RE_TOKEN = re.compile(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9]{2,}")
+
+_DEFAULT_GAP_THRESHOLD = 2.5
+_DEFAULT_MAX_SEG_SECONDS = 180.0
+_DEFAULT_MAX_SEG_LINES = 80
+
+_DEFAULT_STOPWORDS = {
+    "的",
+    "了",
+    "和",
+    "是",
+    "在",
+    "就",
+    "都",
+    "而",
+    "也",
+    "还",
+    "很",
+    "又",
+    "啊",
+    "呀",
+    "吗",
+    "呢",
+    "吧",
+    "这个",
+    "那个",
+    "我们",
+    "你们",
+    "他们",
+    "她们",
+    "自己",
+    "一个",
+    "没有",
+    "不是",
+}
 
 
 def _ts_to_sec(ts: str) -> float:
@@ -206,6 +269,50 @@ def segment_dialogues(dialogues: Sequence[DialogueLine], gap_threshold: float) -
     return groups
 
 
+def split_dialogue_group(
+    group: Sequence[DialogueLine],
+    max_seconds: float = _DEFAULT_MAX_SEG_SECONDS,
+    max_lines: int = _DEFAULT_MAX_SEG_LINES,
+) -> List[List[DialogueLine]]:
+    items = list(group)
+    if not items:
+        return []
+    out: List[List[DialogueLine]] = []
+    i = 0
+    n = len(items)
+    max_lines = max(1, int(max_lines))
+    max_seconds = max(1.0, float(max_seconds))
+    while i < n:
+        start = float(items[i].start)
+        best_j = i
+        j = i
+        while j < n:
+            end = float(items[j].end)
+            dur = end - start
+            line_count = j - i + 1
+            if dur <= max_seconds and line_count <= max_lines:
+                best_j = j
+                j += 1
+                continue
+            break
+        if best_j < i:
+            best_j = i
+        out.append(items[i : best_j + 1])
+        i = best_j + 1
+    return out
+
+
+def split_dialogue_groups(
+    groups: Sequence[Sequence[DialogueLine]],
+    max_seconds: float = _DEFAULT_MAX_SEG_SECONDS,
+    max_lines: int = _DEFAULT_MAX_SEG_LINES,
+) -> List[List[DialogueLine]]:
+    out: List[List[DialogueLine]] = []
+    for g in groups:
+        out.extend(split_dialogue_group(g, max_seconds=max_seconds, max_lines=max_lines))
+    return out
+
+
 def build_segments(
     dialogue_groups: Sequence[Sequence[DialogueLine]],
     visions: Sequence[VisionEvent],
@@ -263,12 +370,211 @@ def build_segments(
     return segments
 
 
+def _safe_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _count_chars(text: str) -> int:
+    if not text:
+        return 0
+    s = re.sub(r"\s+", "", text)
+    return len(s)
+
+
+def _density_label(rate: float) -> str:
+    if rate < 2.0:
+        return "稀疏"
+    if rate > 4.0:
+        return "密集"
+    return "正常"
+
+
+def _extract_speakers(lines: Sequence[DialogueLine]) -> List[str]:
+    speakers: List[str] = []
+    seen = set()
+    for d in lines:
+        txt = (d.text or "").strip()
+        m = _RE_SPEAKER.match(txt)
+        if not m:
+            continue
+        name = str(m.group(1)).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        speakers.append(name)
+    return speakers
+
+
+def _load_stopwords(path: str) -> set[str]:
+    out = set(_DEFAULT_STOPWORDS)
+    if not path:
+        return out
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                w = raw.strip()
+                if w:
+                    out.add(w)
+    except Exception:
+        pass
+    return out
+
+
+def _load_people_names(path: str) -> Dict[str, str]:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for k, v in data.items():
+        if not isinstance(k, str) or not k:
+            continue
+        if v is None:
+            continue
+        if isinstance(v, str):
+            name = v.strip()
+        else:
+            name = str(v).strip()
+        if name:
+            out[k] = name
+    return out
+
+
+def _map_people_ids(people_ids: Sequence[str], names_map: Dict[str, str]) -> List[str]:
+    if not people_ids:
+        return []
+    out: List[str] = []
+    seen = set()
+    for pid in people_ids:
+        key = str(pid)
+        name = names_map.get(key)
+        val = name if name else key
+        if val in seen:
+            continue
+        seen.add(val)
+        out.append(val)
+    return out
+
+
+def _top_terms(text: str, top_k: int, stopwords: set[str]) -> List[str]:
+    top_k = max(1, int(top_k))
+    if not text:
+        return []
+    counter: Counter[str] = Counter()
+    if _HAS_JIEBA and pseg is not None:
+        try:
+            for w in pseg.cut(text):
+                word = str(getattr(w, "word", "") or "").strip()
+                flag = str(getattr(w, "flag", "") or "").strip()
+                if not word or word in stopwords:
+                    continue
+                if len(word) < 2:
+                    continue
+                if not (flag.startswith("n") or flag.startswith("v")):
+                    continue
+                counter[word] += 1
+        except Exception:
+            counter = Counter()
+    if not counter:
+        for m in _RE_TOKEN.finditer(text):
+            tok = m.group(0)
+            if tok in stopwords:
+                continue
+            counter[tok] += 1
+    return [w for w, _ in counter.most_common(top_k)]
+
+
+def _compute_frame_diff_mean(video_path: str, start: float, end: float, sample_sec: float = 1.0) -> Optional[float]:
+    if not _HAS_CV2 or cv2 is None:
+        return None
+    if not video_path or not os.path.exists(video_path):
+        return None
+    dur = max(0.0, float(end) - float(start))
+    if dur <= 0.05:
+        return 0.0
+    sample_sec = float(sample_sec)
+    if dur <= 20.0:
+        sample_sec = min(sample_sec, 0.5)
+    elif dur >= 120.0:
+        sample_sec = max(sample_sec, 1.5)
+    sample_sec = max(0.2, min(2.0, sample_sec))
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    diffs: List[float] = []
+    prev = None
+    t = float(start)
+    try:
+        while t <= float(end) + 1e-6:
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, t) * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                t += sample_sec
+                continue
+            if prev is not None:
+                try:
+                    diff = cv2.absdiff(prev, frame)
+                    diffs.append(float(diff.mean()) / 255.0)
+                except Exception:
+                    pass
+            prev = frame
+            t += sample_sec
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    if not diffs:
+        return 0.0
+    return float(sum(diffs) / float(len(diffs)))
+
+
+def _db_std_from_profile(profile: Optional[Dict[str, Any]], start: float, end: float) -> Tuple[Optional[float], Optional[float]]:
+    if not profile or not _HAS_NUMPY or np is None:
+        return None, None
+    try:
+        times = profile.get("times")
+        rms = profile.get("rms")
+        if times is None or rms is None:
+            return None, None
+        t0 = float(start)
+        t1 = float(end)
+        mask = (times >= t0) & (times <= t1)  # type: ignore[operator]
+        seg = rms[mask]  # type: ignore[index]
+        if seg is None or len(seg) == 0:
+            return 0.0, 0.0
+        seg = np.asarray(seg)
+        seg_max = float(seg.max())
+        eps = 1e-8
+        db = 20.0 * np.log10(np.maximum(seg, eps))
+        return float(np.std(db)), float(seg_max)
+    except Exception:
+        return None, None
+
+
 def write_synopsis(
     segments: Sequence[Segment],
     transcript_path: str,
     out_path: str,
     max_lines: int = 50,
     total_duration: float = 0.0,
+    video_path: Optional[str] = None,
+    keyword_total: int = 0,
+    audio_profile: Optional[Dict[str, Any]] = None,
+    stopwords_path: str = "",
+    people_names: Optional[Dict[str, str]] = None,
+    gap_threshold: float = _DEFAULT_GAP_THRESHOLD,
+    max_seg_seconds: float = _DEFAULT_MAX_SEG_SECONDS,
+    max_seg_lines: int = _DEFAULT_MAX_SEG_LINES,
 ) -> None:
     lines: List[str] = []
     base = os.path.basename(transcript_path)
@@ -277,38 +583,93 @@ def write_synopsis(
         last_end = max(last_end, s.end)
     if not segments:
         last_end = float(total_duration or 0.0)
-    lines.append("# 全片摘要")
-    lines.append(f"transcript：{base}")
-    lines.append(f"全片时长：{_sec_to_hms(last_end)}")
-    lines.append(f"候选段落数：{len(segments)}")
+    lines.append("# 全片字段概览（code-only）")
+    lines.append(f"transcript={base}")
+    lines.append(f"full_duration={_sec_to_hms(last_end)}")
+    lines.append(f"segment_count={len(segments)}")
+    lines.append(f"gap_threshold={float(gap_threshold):.3f}")
+    lines.append(f"max_seg_seconds={float(max_seg_seconds):.1f}")
+    lines.append(f"max_seg_lines={int(max_seg_lines)}")
     lines.append("")
     if len(segments) > max_lines:
         ordered = sorted(segments, key=lambda x: (x.score, x.end - x.start), reverse=True)[:max_lines]
         ordered = sorted(ordered, key=lambda x: x.start)
     else:
         ordered = list(segments)
+    stopwords = _load_stopwords(stopwords_path)
+    people_names = people_names or {}
+    people_freq: Counter[str] = Counter()
+    high_score: List[Tuple[float, Segment]] = []
+    audio_peaks: List[Tuple[float, Segment]] = []
     for s in ordered:
-        preview = " / ".join([d.text for d in s.lines[:3] if d.text])
-        if len(s.lines) > 3:
-            preview = f"{preview} ...（共{len(s.lines)}句）"
-        kw = ",".join(s.keywords) if s.keywords else ""
-        ppl = ",".join(s.people_in_shot) if s.people_in_shot else ""
+        duration = float(s.end) - float(s.start)
+        line_count = len(s.lines)
+        first_line = (s.lines[0].text if s.lines else "").strip()
+        last_line = (s.lines[-1].text if s.lines else "").strip()
+        text_all = "\n".join([d.text for d in s.lines if d.text])
+        char_count = _count_chars(text_all)
+        speech_rate = (float(char_count) / duration) if duration > 1e-6 else 0.0
+        density_label = _density_label(speech_rate)
+        hit_count = len(s.keywords)
+        denom = int(keyword_total) if int(keyword_total) > 0 else 1
+        score = float(hit_count) / float(denom)
+        speakers = _extract_speakers(s.lines)
+        people_ids = speakers if speakers else list(s.people_in_shot or [])
+        people_names_list = _map_people_ids(people_ids, people_names) if people_names else list(people_ids)
+        for p in people_ids:
+            people_freq[p] += 1
+        high_score.append((score, s))
+        top_terms = _top_terms(text_all, top_k=6, stopwords=stopwords)
+        frame_diff_mean = _compute_frame_diff_mean(video_path or "", s.start, s.end) if video_path else None
+        db_std, rms_max = _db_std_from_profile(audio_profile, s.start, s.end)
+        if rms_max is not None:
+            audio_peaks.append((float(rms_max), s))
+        vision_fmt = ""
+        if frame_diff_mean is not None:
+            vision_label = "动态" if float(frame_diff_mean) >= 0.06 else "静态"
+            vision_fmt = f"{vision_label}(帧差={frame_diff_mean:.3f})"
+        audio_fmt = f"dB_std={db_std:.2f}" if db_std is not None else ""
         part = (
-            f"[{_sec_to_hms(s.start)} - {_sec_to_hms(s.end)}] "
-            f"“{preview}”"
-            f" / score={s.score:.2f}"
+            f"[{_sec_to_hms(s.start)} - {_sec_to_hms(s.end)}]"
+            f" duration={duration:.2f}"
+            f" lines={line_count}"
+            f" score={score:.3f}({hit_count}/{denom})"
+            f" first={_safe_json(first_line)}"
+            f" last={_safe_json(last_line)}"
+            f" top_terms={_safe_json(top_terms)}"
+            f" people={_safe_json(people_names_list)}"
         )
-        if kw:
-            part += f" / keywords=[{kw}]"
-        if s.vision_tag:
-            part += f" / 视觉：{s.vision_tag}"
-        if s.audio_tag:
-            part += f" / 听觉：{s.audio_tag}"
-        if s.density_tag:
-            part += f" / 台词密度：{s.density_tag}"
-        if ppl:
-            part += f" / 出镜人物：{ppl}"
+        if people_names:
+            part += f" people_pid={_safe_json(list(people_ids))}"
+        if s.keywords:
+            part += f" keywords_hit={_safe_json(list(s.keywords))}"
+        if vision_fmt:
+            part += f" vision={_safe_json(vision_fmt)}"
+        if audio_fmt:
+            part += f" audio={_safe_json(audio_fmt)}"
+        part += f" speech_rate={speech_rate:.2f}"
+        part += f" density={_safe_json(density_label)}"
         lines.append(part)
+
+    lines.append("")
+    lines.append("# 统计")
+    durations = [float(s.end) - float(s.start) for s in ordered]
+    if durations:
+        lines.append(f"duration_min={min(durations):.2f}")
+        lines.append(f"duration_avg={(sum(durations)/len(durations)):.2f}")
+        lines.append(f"duration_max={max(durations):.2f}")
+    top_scored = sorted(high_score, key=lambda x: x[0], reverse=True)[:10]
+    lines.append("top_score_segments=" + _safe_json([
+        {"start": _sec_to_hms(s.start), "end": _sec_to_hms(s.end), "score": round(sc, 3)}
+        for sc, s in top_scored
+    ]))
+    lines.append("top_people=" + _safe_json(people_freq.most_common(20)))
+    if audio_peaks:
+        top_peaks = sorted(audio_peaks, key=lambda x: x[0], reverse=True)[:10]
+        lines.append("top_audio_peaks=" + _safe_json([
+            {"start": _sec_to_hms(s.start), "end": _sec_to_hms(s.end), "rms_max": round(v, 6)}
+            for v, s in top_peaks
+        ]))
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
@@ -401,6 +762,7 @@ def export_all(
     context_window: float,
     extract_frames: bool,
     keywords: Optional[Sequence[Tuple[str, float]]] = None,
+    people_names_path: str = "",
 ) -> Dict[str, Any]:
     keywords = list(keywords) if keywords is not None else _default_keywords()
     _ensure_dir(out_dir)
@@ -417,10 +779,27 @@ def export_all(
         dialogues = pseudo
         all_lines.sort(key=lambda x: (x.t0, x.t1))
     groups = segment_dialogues(dialogues, gap_threshold=gap_threshold)
+    groups = split_dialogue_groups(groups, max_seconds=_DEFAULT_MAX_SEG_SECONDS, max_lines=_DEFAULT_MAX_SEG_LINES)
     segments = build_segments(groups, visions, keywords=keywords, people_pad_sec=5.0)
     synopsis_path = os.path.join(out_dir, "synopsis.txt")
     total_duration = max([float(l.t1) for l in all_lines], default=0.0)
-    write_synopsis(segments, transcript_path=transcript_path, out_path=synopsis_path, total_duration=total_duration)
+    audio_profile = None
+    if _HAS_AUDIO_PROFILE and get_audio_rms_profile is not None and video_path and os.path.exists(video_path):
+        audio_profile = get_audio_rms_profile(video_path)
+    people_names = _load_people_names(people_names_path)
+    write_synopsis(
+        segments,
+        transcript_path=transcript_path,
+        out_path=synopsis_path,
+        total_duration=total_duration,
+        video_path=video_path,
+        keyword_total=len(keywords),
+        audio_profile=audio_profile,
+        people_names=people_names,
+        gap_threshold=gap_threshold,
+        max_seg_seconds=_DEFAULT_MAX_SEG_SECONDS,
+        max_seg_lines=_DEFAULT_MAX_SEG_LINES,
+    )
     write_segment_contexts(segments, all_lines=all_lines, out_dir=out_dir, context_window=context_window)
     frame_dir = os.path.join(out_dir, "frames")
     if extract_frames and video_path and os.path.exists(video_path) and _HAS_CV2:
@@ -464,8 +843,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--transcript", required=True)
     p.add_argument("--video", default="")
     p.add_argument("--out", required=True)
-    p.add_argument("--gap-threshold", type=float, default=6.0)
+    p.add_argument("--gap-threshold", type=float, default=_DEFAULT_GAP_THRESHOLD)
     p.add_argument("--context-window", type=float, default=30.0)
+    p.add_argument("--people-names", default="", help="Path to people_names.json for pXX -> real name mapping.")
     p.add_argument("--no-frames", action="store_true")
     args = p.parse_args(argv)
     transcript_path = str(args.transcript)
@@ -479,6 +859,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gap_threshold=float(args.gap_threshold),
         context_window=float(args.context_window),
         extract_frames=extract_frames,
+        people_names_path=str(getattr(args, "people_names", "") or "").strip(),
     )
     return 0
 

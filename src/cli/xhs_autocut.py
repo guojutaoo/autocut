@@ -144,6 +144,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Dump detected face crops and boxed frames for inspection.",
     )
+    parser.add_argument(
+        "--from-plan",
+        default="",
+        help="Render directly from a JSON plan file (LLM 文案驱动渲染模式).",
+    )
     return parser
 
 
@@ -702,6 +707,7 @@ def main(argv: Any = None) -> None:
     freeze_effect = args.freeze_effect
     faces_only = bool(getattr(args, "faces_only", False))
     faces_sample_sec = float(getattr(args, "faces_sample_sec", 3.0) or 3.0)
+    from_plan = str(getattr(args, "from_plan", "") or "").strip()
 
     if not os.path.exists(video_path):
         logger.error("Input video does not exist: %s", video_path)
@@ -1251,6 +1257,7 @@ def main(argv: Any = None) -> None:
         llm_input_dir = os.path.join(out_dir, "llm_input")
         if os.path.exists(exporter):
             extract_frames = str(os.environ.get("AUTOCUT_EXPORT_FRAMES", "0")).strip().lower() in {"1", "true"}
+            people_names_path = os.path.join(project_root, "people_names.json")
             cmd = [
                 sys.executable,
                 exporter,
@@ -1261,10 +1268,12 @@ def main(argv: Any = None) -> None:
                 "--out",
                 llm_input_dir,
                 "--gap-threshold",
-                str(gap_threshold),
+                "2.5",
                 "--context-window",
                 "30.0",
             ]
+            if os.path.exists(people_names_path):
+                cmd += ["--people-names", people_names_path]
             if not extract_frames:
                 cmd.append("--no-frames")
             subprocess.run(cmd, check=False)

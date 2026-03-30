@@ -2,12 +2,15 @@
 VIDEO_PATH="/Users/bytedance/Downloads/01.mp4"
 OUT_DIR="outputs/autocut_project"
 
-export AUTOCUT_ASR_MODEL="tiny"
+export AUTOCUT_ASR_MODEL="medium"
 export AUTOCUT_ASR_LANG="zh"
+
+rm -rf "$OUT_DIR/transcription"
 
 python3 -m src.cli.xhs_autocut \
   --video "$VIDEO_PATH" \
   --out "$OUT_DIR" \
+  --transcribe \
   --target-duration 300 \
   --portrait 1080x1920 \
   --title-prefix '雍正王朝权谋解析' \

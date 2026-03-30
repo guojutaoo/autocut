@@ -3,7 +3,8 @@ numpy
 librosa
 pydub
 PyYAML
-edge-tts  # Optional TTS; in offline environments you can skip this, code will fall back to short silent WAV.
+jieba
+https://www.bilibili.com/video/BV1Hy4y1J7xH/?spm_id_from=333.337.search-card.all.click&vd_source=0a8aa3b28d81c947c822de43f20116d0edge-tts  # Optional TTS; in offline environments you can skip this, code will fall back to short silent WAV.
 
 # Optional vision emotion libraries (not required to run the PoC):
 # deepface

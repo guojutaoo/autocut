@@ -143,15 +143,20 @@ def _load_names_map(path: str) -> Dict[str, str]:
 
 def _write_names_template(path: str, person_ids: List[str]) -> Dict[str, str]:
     existing = _load_names_map(path)
+    keep = set([p for p in person_ids if isinstance(p, str) and p])
+    compact: Dict[str, str] = {}
+    for k, v in existing.items():
+        if k in keep or (isinstance(v, str) and v.strip()):
+            compact[k] = (v or "").strip()
     for pid in person_ids:
-        if pid not in existing:
-            existing[pid] = ""
+        if pid not in compact:
+            compact[pid] = ""
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2)
+            json.dump(compact, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
-    return existing
+    return compact
 
 
 def _quality_score(bgr: Any) -> float:
@@ -300,8 +305,6 @@ def build_people_library(
                     if not ppl:
                         continue
                 for pid in ppl:
-                    if max_people > 0 and pid not in saved and len(saved) >= int(max_people):
-                        continue
                     if pid not in saved:
                         saved[pid] = []
                         kept_people.append(pid)
@@ -334,8 +337,6 @@ def build_people_library(
                         if idx >= len(ppl):
                             break
                         pid = ppl[idx]
-                        if max_people > 0 and pid not in saved and len(saved) >= int(max_people):
-                            continue
                         bbox = f.get("bbox")
                         crop = _safe_crop(frame, bbox if isinstance(bbox, list) else [])
                         if crop is None:
@@ -416,36 +417,90 @@ def build_people_library(
             faces = vision.get("faces") or []
             for f in faces:
                 pid = f.get("person_id")
-                bbox = f.get("bbox")
                 if not isinstance(pid, str) or not pid:
                     continue
                 if allow is not None and pid not in allow:
                     continue
-                if max_people > 0 and pid not in saved and len(saved) >= int(max_people):
-                    continue
                 seen_counts[pid] = int(seen_counts.get(pid, 0)) + 1
                 first_seen[pid] = min(float(first_seen.get(pid, t) or t), float(t))
                 last_seen[pid] = max(float(last_seen.get(pid, t) or t), float(t))
-                if not include_images:
-                    if pid not in saved:
-                        saved[pid] = []
-                        kept_people.append(pid)
-                    continue
-                crop = _safe_crop(frame, bbox if isinstance(bbox, list) else [])
-                if crop is None:
-                    continue
-                area = int(crop.shape[0] * crop.shape[1]) if hasattr(crop, "shape") else 0
-                sharp = _quality_score(crop)
-                score = float(area) * 0.001 + float(sharp)
-                pid_dir = os.path.join(crops_dir, pid)
+
+        top_keep: Optional[set[str]] = None
+        top_n = int(max_people or 0)
+        if top_n > 0 and seen_counts:
+            ranked = sorted(seen_counts.items(), key=lambda kv: int(kv[1]), reverse=True)
+            top_keep = set([str(k) for k, _ in ranked[:top_n]])
+            if allow is not None:
+                top_keep = set([p for p in top_keep if p in allow])
+
+        if not include_images:
+            keep_ids = sorted(list(top_keep)) if top_keep is not None else sorted(seen_counts.keys())
+            for pid in keep_ids:
                 if pid not in saved:
-                    _safe_mkdir(pid_dir)
                     saved[pid] = []
                     kept_people.append(pid)
-                keep_list = saved[pid]
-                fname = f"{pid}_{frame_idx:06d}_{_sec_to_ts(float(t)).replace(':','-').replace(',','.')}.jpg"
-                out_path = os.path.join(pid_dir, fname)
-                if len(keep_list) < int(max_images_per_person):
+        else:
+            frame_idx = 0
+            for t, frame in read_video_frames(video_path, frame_stride=stride):
+                frame_idx += 1
+                vision = extract_face_vision_on_frame(
+                    frame,
+                    assigner,
+                    max_faces=int(max_faces_per_frame),
+                    min_face_area=int(min_face_area),
+                )
+                faces = vision.get("faces") or []
+                for f in faces:
+                    pid = f.get("person_id")
+                    bbox = f.get("bbox")
+                    if not isinstance(pid, str) or not pid:
+                        continue
+                    if top_keep is not None and pid not in top_keep:
+                        continue
+                    if allow is not None and pid not in allow:
+                        continue
+                    crop = _safe_crop(frame, bbox if isinstance(bbox, list) else [])
+                    if crop is None:
+                        continue
+                    area = int(crop.shape[0] * crop.shape[1]) if hasattr(crop, "shape") else 0
+                    sharp = _quality_score(crop)
+                    score = float(area) * 0.001 + float(sharp)
+                    pid_dir = os.path.join(crops_dir, pid)
+                    if pid not in saved:
+                        _safe_mkdir(pid_dir)
+                        saved[pid] = []
+                        kept_people.append(pid)
+                    keep_list = saved[pid]
+                    fname = f"{pid}_{frame_idx:06d}_{_sec_to_ts(float(t)).replace(':','-').replace(',','.')}.jpg"
+                    out_path = os.path.join(pid_dir, fname)
+                    if len(keep_list) < int(max_images_per_person):
+                        ok = False
+                        try:
+                            ok = bool(cv2.imwrite(out_path, crop))  # type: ignore[attr-defined]
+                        except Exception:
+                            ok = False
+                        if not ok:
+                            continue
+                        keep_list.append(
+                            _SavedFace(
+                                person_id=pid,
+                                path=out_path,
+                                time_sec=float(t),
+                                bbox=[int(v) for v in (bbox or [0, 0, 0, 0])],
+                                area=int(area),
+                                sharpness=float(sharp),
+                                score=float(score),
+                            )
+                        )
+                        continue
+                    worst_idx = -1
+                    worst_score = float("inf")
+                    for i, it in enumerate(keep_list):
+                        if float(it.score) < worst_score:
+                            worst_score = float(it.score)
+                            worst_idx = i
+                    if worst_idx < 0 or float(score) <= float(worst_score):
+                        continue
                     ok = False
                     try:
                         ok = bool(cv2.imwrite(out_path, crop))  # type: ignore[attr-defined]
@@ -453,48 +508,21 @@ def build_people_library(
                         ok = False
                     if not ok:
                         continue
-                    keep_list.append(
-                        _SavedFace(
-                            person_id=pid,
-                            path=out_path,
-                            time_sec=float(t),
-                            bbox=[int(v) for v in (bbox or [0, 0, 0, 0])],
-                            area=int(area),
-                            sharpness=float(sharp),
-                            score=float(score),
-                        )
+                    old = keep_list[worst_idx]
+                    try:
+                        if old.path and os.path.exists(old.path):
+                            os.remove(old.path)
+                    except Exception:
+                        pass
+                    keep_list[worst_idx] = _SavedFace(
+                        person_id=pid,
+                        path=out_path,
+                        time_sec=float(t),
+                        bbox=[int(v) for v in (bbox or [0, 0, 0, 0])],
+                        area=int(area),
+                        sharpness=float(sharp),
+                        score=float(score),
                     )
-                    continue
-                worst_idx = -1
-                worst_score = float("inf")
-                for i, it in enumerate(keep_list):
-                    if float(it.score) < worst_score:
-                        worst_score = float(it.score)
-                        worst_idx = i
-                if worst_idx < 0 or float(score) <= float(worst_score):
-                    continue
-                ok = False
-                try:
-                    ok = bool(cv2.imwrite(out_path, crop))  # type: ignore[attr-defined]
-                except Exception:
-                    ok = False
-                if not ok:
-                    continue
-                old = keep_list[worst_idx]
-                try:
-                    if old.path and os.path.exists(old.path):
-                        os.remove(old.path)
-                except Exception:
-                    pass
-                keep_list[worst_idx] = _SavedFace(
-                    person_id=pid,
-                    path=out_path,
-                    time_sec=float(t),
-                    bbox=[int(v) for v in (bbox or [0, 0, 0, 0])],
-                    area=int(area),
-                    sharpness=float(sharp),
-                    score=float(score),
-                )
 
     people: List[Dict[str, Any]] = []
     if not names_path:
@@ -519,7 +547,7 @@ def build_people_library(
         items_sorted = sorted(items, key=lambda x: float(x.score), reverse=True)
         img_paths = [it.path for it in items_sorted if it.path and os.path.exists(it.path)]
         sheet_path = os.path.join(sheets_dir, f"{pid}.jpg")
-        _write_contact_sheet(img_paths[: int(max_images_per_person)], sheet_path)
+        _write_contact_sheet(img_paths, sheet_path)
         people.append(
             {
                 "person_id": pid,
