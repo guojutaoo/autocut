@@ -144,11 +144,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Dump detected face crops and boxed frames for inspection.",
     )
-    parser.add_argument(
-        "--from-plan",
-        default="",
-        help="Render directly from a JSON plan file (LLM 文案驱动渲染模式).",
-    )
     return parser
 
 
@@ -707,7 +702,6 @@ def main(argv: Any = None) -> None:
     freeze_effect = args.freeze_effect
     faces_only = bool(getattr(args, "faces_only", False))
     faces_sample_sec = float(getattr(args, "faces_sample_sec", 3.0) or 3.0)
-    from_plan = str(getattr(args, "from_plan", "") or "").strip()
 
     if not os.path.exists(video_path):
         logger.error("Input video does not exist: %s", video_path)
@@ -1249,6 +1243,60 @@ def main(argv: Any = None) -> None:
     logger.info("Segmentation plan for LLM written to %s", plan_path)
 
     try:
+        people_ids = set()
+        for seg in plan_segments:
+            vision = seg.get("vision") if isinstance(seg, dict) else None
+            if not isinstance(vision, dict):
+                continue
+            ppl = vision.get("people_in_shot")
+            if isinstance(ppl, list):
+                for pid in ppl:
+                    if isinstance(pid, str) and pid and not pid.startswith("u"):
+                        people_ids.add(pid)
+            dom = vision.get("dominant_person_id")
+            if isinstance(dom, str) and dom and not dom.startswith("u"):
+                people_ids.add(dom)
+            faces = vision.get("faces")
+            if isinstance(faces, list):
+                for f in faces:
+                    if not isinstance(f, dict):
+                        continue
+                    pid = f.get("person_id")
+                    if isinstance(pid, str) and pid and not pid.startswith("u"):
+                        people_ids.add(pid)
+
+        names_path = os.path.join(out_dir, "people_names.json")
+        existing = {}
+        if os.path.exists(names_path):
+            try:
+                with open(names_path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(k, str) and k:
+                            existing[k] = v if isinstance(v, str) else ("" if v is None else str(v))
+                elif isinstance(data, list):
+                    for it in data:
+                        if not isinstance(it, dict):
+                            continue
+                        pid = it.get("person_id")
+                        name = it.get("name")
+                        if isinstance(pid, str) and pid:
+                            existing[pid] = name if isinstance(name, str) else ("" if name is None else str(name))
+            except Exception:
+                existing = {}
+
+        for pid in sorted(people_ids):
+            if pid not in existing:
+                existing[pid] = ""
+
+        with open(names_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        logger.info("People names template written to %s", names_path)
+    except Exception:
+        pass
+
+    try:
         import subprocess
         import sys
 
@@ -1257,7 +1305,6 @@ def main(argv: Any = None) -> None:
         llm_input_dir = os.path.join(out_dir, "llm_input")
         if os.path.exists(exporter):
             extract_frames = str(os.environ.get("AUTOCUT_EXPORT_FRAMES", "0")).strip().lower() in {"1", "true"}
-            people_names_path = os.path.join(project_root, "people_names.json")
             cmd = [
                 sys.executable,
                 exporter,
@@ -1268,12 +1315,10 @@ def main(argv: Any = None) -> None:
                 "--out",
                 llm_input_dir,
                 "--gap-threshold",
-                "2.5",
+                str(gap_threshold),
                 "--context-window",
                 "30.0",
             ]
-            if os.path.exists(people_names_path):
-                cmd += ["--people-names", people_names_path]
             if not extract_frames:
                 cmd.append("--no-frames")
             subprocess.run(cmd, check=False)
