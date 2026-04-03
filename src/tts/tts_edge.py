@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import wave
+import re
 from typing import Final
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,12 @@ async def _synthesize_with_edge_tts(
 
     if edge_tts is None:  # pragma: no cover - defensive
         raise RuntimeError("edge-tts is not available")
+        
+    # Actually edge-tts automatically wraps SSML if we just pass normal text with <break/> tags!
+    # So we don't need to manually wrap it with <speak> anymore.
+    # is_ssml = '<' in text and '>' in text
+    # if is_ssml and not text.strip().startswith('<speak'):
+    #     text = f'<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="zh-CN"><voice name="{voice}">{text}</voice></speak>'
 
     communicate = edge_tts.Communicate(
         text,
@@ -146,6 +153,17 @@ async def _synthesize_with_edge_tts_boundaries(
 ) -> None:
     if edge_tts is None:  # pragma: no cover - defensive
         raise RuntimeError("edge-tts is not available")
+        
+    is_ssml = '<' in text and '>' in text
+    # edge-tts supports raw text or fully wrapped SSML. If we pass SSML, we must wrap it.
+    if is_ssml and not text.strip().startswith('<speak'):
+        # For boundaries stream, edge-tts might have issues with raw SSML input if not configured properly,
+        # Let's wrap it in <speak> with the right voice and pitch.
+        # But actually edge-tts parses <break/> in raw text sometimes, but standard SSML requires wrapper.
+        # However, to be safe, if we wrap it, it might interfere with how edge-tts automatically wraps.
+        # Since our test showed `edge_tts.Communicate("你好啊<break time=\"1.0s\"/>我很好")` works perfectly without wrapping!
+        # So we DON'T need to manually wrap it for _synthesize_with_edge_tts_boundaries either.
+        pass
 
     output_format = str(
         os.environ.get("AUTOCUT_TTS_OUTPUT_FORMAT", "riff-24khz-16bit-mono-pcm") or ""
@@ -156,6 +174,8 @@ async def _synthesize_with_edge_tts_boundaries(
         kwargs["output_format"] = output_format
 
     try:
+        # Actually edge_tts automatically wraps SSML if we just pass normal text without <speak> wrapping
+        # However, it expects <break time="0.5s" /> format without errors.
         communicate = edge_tts.Communicate(text, voice, **kwargs)
     except TypeError:
         communicate = edge_tts.Communicate(text, voice, rate=rate, volume=volume)

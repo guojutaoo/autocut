@@ -33,13 +33,8 @@ except Exception:
     pseg = None  # type: ignore
     _HAS_JIEBA = False
 
-try:
-    from src.ingestion.ingestor import get_audio_rms_profile  # type: ignore
-
-    _HAS_AUDIO_PROFILE = True
-except Exception:
-    get_audio_rms_profile = None  # type: ignore
-    _HAS_AUDIO_PROFILE = False
+get_audio_rms_profile = None  # type: ignore
+_HAS_AUDIO_PROFILE = False
 
 
 _TS_RE = r"\d\d:\d\d:\d\d[,.]\d\d\d"
@@ -784,8 +779,13 @@ def export_all(
     synopsis_path = os.path.join(out_dir, "synopsis.txt")
     total_duration = max([float(l.t1) for l in all_lines], default=0.0)
     audio_profile = None
-    if _HAS_AUDIO_PROFILE and get_audio_rms_profile is not None and video_path and os.path.exists(video_path):
-        audio_profile = get_audio_rms_profile(video_path)
+    if video_path and os.path.exists(video_path):
+        try:
+            from src.ingestion.ingestor import get_audio_rms_profile as _get_audio_rms_profile  # type: ignore
+
+            audio_profile = _get_audio_rms_profile(video_path)
+        except Exception:
+            audio_profile = None
     people_names = _load_people_names(people_names_path)
     write_synopsis(
         segments,

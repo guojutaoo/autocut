@@ -1,0 +1,99 @@
+# autocut 项目上下文接续文档
+# 把这个文件内容发给新对话，让它继续工作
+
+---
+
+## 项目概述
+
+autocut 是一个自动化视频剪辑系统，用于为中国历史剧（《雍正王朝》第一集）生成短视频解说视频，目标平台为小红书。
+
+核心架构：3-Skill LLM Pipeline
+- **Skill 1 (Script Architect)**：结构规划师——根据原始台词文件，规划 25-40 个 5-15 秒的 segment
+- **Skill 2 (Segment Writer)**：分段撰稿人——基于台词锚定规则，为每个 seg 写解说词
+- **Skill 3 (Script Polisher)**：质检员——14 维度检查，含一票否决
+
+---
+
+## 当前版本: v9（台词锚定版）
+
+### v9 核心升级（vs v8）
+v8 发现了一个根本性问题：**narration 是凭"剧情印象"写的，不是基于实际台词时间戳写的**。
+- 典型错误：Seg05 (00:06:16-00:06:30) narration 写"康熙追问银子去向"，但实际台词是大臣提议调粮 + 四阿哥迟到被质问
+- v9 修复方案：**台词锚定机制**
+  - Skill 1 新增 `transcript_lines` 字段，直接从原始台词文件复制精确时间戳台词
+  - Skill 2 的 `dialogue_summary` 必须直接引用 transcript_lines 原文
+  - Skill 2 的 `narration` 只能描述 transcript_lines 所反映的剧情
+  - Skill 3 新增 A1/A2 一票否决维度
+
+### v9 剧本指标
+- 34 个 seg（1 intro + 31 overdub + 1 sub + 1 freeze）
+- 总时长 7.7 分钟（目标 6-8 分钟）
+- 全部 video_speed 在 0.8-1.5 范围 ✅
+- break 总计 7.2s（限制 ≤ 8s）✅
+- overdub 占比 91%（要求 ≥ 85%）✅
+- 零剧透 ✅
+- Skill 3 质检通过 ✅
+
+---
+
+## 4 种 render_type
+
+| 类型 | 说明 | 占比限制 |
+|------|------|---------|
+| intro | 片头曲+开场介绍 | 仅 Seg01 |
+| overdub | 原始音频 -15dB + TTS 叠加 | ≥ 85% |
+| freeze | 静帧 + TTS | ≤ 2 个，≤ 20 字 |
+| sub | 多镜头拼接 + TTS | 按需 |
+
+## transition_type（段间转场）
+- `cut`：同场景硬切
+- `crossfade`：小幅场景变化
+- `fade_black`：大时间/场景跳转
+- `swipe`：平行叙事（"另一边..."）
+
+## SSML 停顿规则
+- `<break time="Xs"/>` 放在标点后
+- 单次 0.3-1.5s，全片总计 ≤ 8s
+- `char_count` 不含 SSML 标签
+- `estimated_duration_sec` = char_count / 4.0 + break_seconds
+
+## video_speed 计算
+- `video_speed = clip_duration_sec / estimated_duration_sec`
+- 范围 0.8 ~ 1.5
+- TTS 语速 = 4 字/秒
+
+---
+
+## 已生成的文件（在 Mira 沙箱 /opt/tiger/mira_nas/workspace/85374181651/ 下）
+
+### v9 核心产出
+- `autocut_skills_v9.py` — 3 个 Skill 的完整 prompt
+- `v9_skill1_output.json` — Skill 1 输出（34 seg + transcript_lines）
+- `v9_anchored.json` — 最终剧本（Skill 2 输出，已通过质检）
+- `v9_field_readme.md` — v9 字段说明文档
+- `v9_skill3_check.py` — Skill 3 质检脚本
+- `transcript_data.py` — 6 段原始台词数据
+
+### 历史版本（供参考）
+- v4 → v5 → v6（清理伪跳剪）→ v7（seg 拆碎 + render_type）→ v8（SSML + 零剧透）→ **v9（台词锚定）**
+
+---
+
+## 待解决问题
+
+1. **people_names.json** 映射还未接入
+2. **关键词扩展评分**机制未实现
+3. **微段落合并**逻辑未实现
+4. **v9 的 Skill prompt 需要写入项目的实际 Skill 文件中**
+5. **v9_anchored.json 需要放到项目的 step2 输出路径**
+6. **step3_render.sh 需要适配 v9 的新字段**（transcript_lines、break_seconds 等）
+
+---
+
+## 关键规则摘要
+
+1. **台词锚定**：narration 的每一句话必须在 transcript_lines 中找到依据
+2. **零剧透**：只描述当前 seg 画面上正在发生的事
+3. **Seg 拆碎**：靠拆碎来对齐，而不是在长 seg 里猜时间
+4. **Sub_clips 规则**：相邻间隔 ≤3s 必须合并（禁止伪跳剪）
+5. **TTS 是主时钟**：video_speed = clip_duration / tts_duration

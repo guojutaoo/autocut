@@ -131,6 +131,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--render", action="store_true", help="Perform TTS synthesis and video rendering (heavy tasks)."
     )
     parser.add_argument(
+        "--from-plan",
+        default="",
+        help="Render from an existing JSON plan file (LLM output). When provided, ignores segmentation and goes straight to rendering.",
+    )
+    parser.add_argument(
         "--freeze-effect",
         default=None,
         help=(
@@ -702,6 +707,7 @@ def main(argv: Any = None) -> None:
     freeze_effect = args.freeze_effect
     faces_only = bool(getattr(args, "faces_only", False))
     faces_sample_sec = float(getattr(args, "faces_sample_sec", 3.0) or 3.0)
+    from_plan = str(getattr(args, "from_plan", "") or "").strip()
 
     if not os.path.exists(video_path):
         logger.error("Input video does not exist: %s", video_path)
@@ -711,21 +717,25 @@ def main(argv: Any = None) -> None:
 
     if faces_only:
         import cv2
-        from ..ingestion.ingestor import read_video_frames
         from ..vision.face_emotion import dbscan_cosine, detect_faces_on_frame, default_min_quality_to_update, estimate_face_quality
 
         fps = 30.0
+        dur = 0.0
         try:
             cap = cv2.VideoCapture(video_path)
             if cap.isOpened():
                 fps_val = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
                 if fps_val > 0.1:
                     fps = fps_val
+                fc = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                if fc > 0 and fps > 0:
+                    dur = max(dur, fc / fps)
             cap.release()
         except Exception:
             pass
 
-        stride = max(1, int(round(fps * max(0.1, faces_sample_sec))))
+        if dur <= 0:
+            dur = _get_video_duration(video_path)
         dump_dir = os.path.join(out_dir, "faces", "all_frames")
         os.makedirs(dump_dir, exist_ok=True)
         crops_dir = os.path.join(dump_dir, "crops")
@@ -737,13 +747,15 @@ def main(argv: Any = None) -> None:
         min_q = float(default_min_quality_to_update() or 0.0)
 
         det_idx = 0
-        for ts, frame in read_video_frames(video_path, frame_stride=stride):
-            if ts < skip_start:
-                continue
-            if skip_end > 0:
-                dur = _get_video_duration(video_path)
-                if dur > 0 and ts > max(0.0, dur - skip_end):
-                    break
+        cap = cv2.VideoCapture(video_path)
+        end_t = (float(dur) - float(skip_end)) if float(dur) > 0 else float("inf")
+        t = float(skip_start)
+        while cap.isOpened() and t <= end_t:
+            cap.set(cv2.CAP_PROP_POS_MSEC, float(t) * 1000.0)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            ts = float(t)
             faces = detect_faces_on_frame(frame, max_faces=5)
             for f in faces:
                 bbox = f.get("bbox") or []
@@ -787,6 +799,11 @@ def main(argv: Any = None) -> None:
                     except Exception:
                         pass
                 det_idx += 1
+            t += max(0.1, float(faces_sample_sec))
+        try:
+            cap.release()
+        except Exception:
+            pass
 
         eps = float(os.environ.get("AUTOCUT_DBSCAN_EPS") or "0.32")
         min_samples = int(os.environ.get("AUTOCUT_DBSCAN_MIN_SAMPLES") or "4")
@@ -872,7 +889,109 @@ def main(argv: Any = None) -> None:
         #
         # 保持此列表不变，构建并行的音频/文本数组，按索引对齐。
         segments_data = plan_data.get("segments", [])
-        narration_texts = [s["narration_text"] for s in segments_data]
+        try:
+            if isinstance(segments_data, list) and segments_data and isinstance(segments_data[0], dict):
+                def _parse_hhmmss(text: Any) -> float:
+                    s = str(text or "").strip()
+                    if not s:
+                        return 0.0
+                    parts = s.split(":")
+                    parts.reverse()
+                    sec = 0.0
+                    for i, p in enumerate(parts):
+                        try:
+                            sec += float(p) * (60**i)
+                        except Exception:
+                            pass
+                    return sec
+
+                def _get_narration_text(seg: Dict[str, Any]) -> str:
+                    v = seg.get("narration_text")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                    nar = seg.get("narration")
+                    if isinstance(nar, str) and nar.strip():
+                        return nar.strip()
+                    if isinstance(nar, dict):
+                        full_text = nar.get("full_text")
+                        if isinstance(full_text, str) and full_text.strip():
+                            return full_text.strip()
+                        bridge = nar.get("bridge")
+                        body = nar.get("body")
+                        parts = []
+                        if isinstance(bridge, str) and bridge.strip():
+                            parts.append(bridge.strip())
+                        if isinstance(body, str) and body.strip():
+                            parts.append(body.strip())
+                        return "\n".join(parts).strip()
+                    return ""
+
+                normalized = []
+                for seg in segments_data:
+                    if not isinstance(seg, dict):
+                        continue
+                    
+                    clip = seg.get("clip")
+                    if isinstance(clip, dict):
+                        start = _parse_hhmmss(str(clip.get("start", "0")))
+                        end = _parse_hhmmss(str(clip.get("end", "0")))
+                    else:
+                        tr = str(seg.get("time_range") or "").strip()
+                        if "-" in tr:
+                            a, b = tr.split("-", 1)
+                            start = _parse_hhmmss(a)
+                            end = _parse_hhmmss(b)
+                        else:
+                            start = 0.0
+                            end = 0.0
+                            
+                    if end <= start:
+                        end = start + 2.0
+                        
+                    anchor_raw = seg.get("freeze_at")
+                    if anchor_raw is None:
+                        anchor_raw = seg.get("anchor_time")
+                    anchor = _parse_hhmmss(str(anchor_raw)) if anchor_raw is not None else (start + end) / 2.0
+                    if anchor < start:
+                        anchor = start
+                    if anchor > end:
+                        anchor = end
+
+                    rt = str(seg.get("render_type") or "overdub").strip().lower()
+                    narration_text = _get_narration_text(seg)
+                    if rt == "pure_audio" and narration_text.strip():
+                        rt = "overdub"
+                    if rt == "intro" or rt == "sub":
+                        rt = "overdub"
+
+                    out: Dict[str, Any] = {
+                        "start": float(start),
+                        "end": float(end),
+                        "anchor_time": float(anchor),
+                        "render_type": rt,
+                        "narration_text": narration_text,
+                    }
+                    if "freeze_duration" in seg:
+                        try:
+                            out["freeze_duration"] = float(seg.get("freeze_duration") or 0.0)
+                        except Exception:
+                            pass
+                    speed_val = seg.get("video_speed") or seg.get("speed")
+                    if speed_val is not None:
+                        try:
+                            s_val = float(speed_val)
+                            out["speed"] = s_val
+                            if abs(s_val - 1.0) > 0.01 and rt == "overdub":
+                                rt = "slow_mo"
+                                out["render_type"] = rt
+                        except Exception:
+                            pass
+                    normalized.append(out)
+                segments_data = normalized
+        except Exception:
+            pass
+
+        narration_texts = [str(s.get("narration_text") or "") for s in (segments_data or []) if isinstance(s, dict)]
         
         # 2) 合成旁白音频
         # 对每个片段：
@@ -886,7 +1005,7 @@ def main(argv: Any = None) -> None:
         os.makedirs(narr_dir, exist_ok=True)
         
         for idx, text in enumerate(narration_texts):
-            rt = str(segments_data[idx].get("render_type") or "freeze").strip().lower()
+            rt = str(segments_data[idx].get("render_type") or "overdub").strip().lower()
             if rt == "pure_audio" or not str(text or "").strip():
                 narration_audios.append(None)
                 freeze_durations.append(0.0)
@@ -921,14 +1040,14 @@ def main(argv: Any = None) -> None:
             if anchor > end:
                 anchor = end
             
-            rt = str(s.get("render_type") or "freeze").strip().lower()
-            if rt in ("overdub", "pure_audio", "slow_mo"):
+            rt = str(s.get("render_type") or "overdub").strip().lower()
+            if rt in ("overdub", "pure_audio", "slow_mo", "intro"):
                 seg_dict: Dict[str, Any] = {
                     "trigger_index": idx,
                     "trigger_time": anchor,
                     "start": start,
                     "end": end,
-                    "render_type": rt,
+                    "render_type": rt if rt != "intro" else "overdub",
                 }
                 if rt == "slow_mo":
                     seg_dict["speed"] = float(s.get("speed", 0.5))

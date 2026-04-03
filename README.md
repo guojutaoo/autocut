@@ -126,6 +126,41 @@ python -m src.cli.main \
    - 将触发点映射为定格帧导出位置，写出 `frames/*.jpg`；
    - 同时持久化 `triggers.json`（可被下游剪辑/包装工具消费）。
 
+## LLM Step2 导出（Skill 2 Segment Writer 输入）
+
+当你已经拿到 LLM Skill 1 的选段清单（`skill1_output.json`，字段形态与 `outputs/step2.json` 一致）后，可以用 `scripts/export_step2.py` 把“逐字稿 + 视频 + Skill1 选段”导出为 Skill 2 所需的每段上下文与 5 张关键帧截图。
+
+输出目录结构（示例 `llm_step2/`）：
+
+```text
+llm_step2/
+  skill1_output.json
+  step2_manifest.json
+  seg_01_context.txt
+  seg_01_frame_1.jpg
+  seg_01_frame_2.jpg
+  seg_01_frame_3.jpg
+  seg_01_frame_4.jpg
+  seg_01_frame_5.jpg
+  ...
+```
+
+示例命令：
+
+```bash
+./step2_llm.sh \
+  --transcript transcript_for_llm.txt \
+  --synopsis synopsis.txt \
+  --video 雍正王朝_EP01.mp4 \
+  --skill1 skill1_output.json
+```
+
+`--synopsis` 当前不参与生成逻辑，可不传；但传入时会校验文件存在性。
+
+如果只想验证文本与清单（不抽帧），可加 `--no-frames`。
+
+如果不传 `--out`，默认输出到 `outputs/step2/${video文件名去扩展名}`。
+
 ## 测试与验证
 
 项目提供一个最小化示例测试（主要覆盖融合逻辑）：
